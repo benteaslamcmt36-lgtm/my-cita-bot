@@ -136,7 +136,7 @@ def view_clients(message):
     else:
         bot.reply_to(message, "📭 Abhi koi data save nahi hai.")
 @bot.message_handler(commands=["checkslots"])
-def check_slots(message):
+deqf check_slots(message):
     if not allowed(message):
         return bot.reply_to(message, "Access nahi hai.")
 
