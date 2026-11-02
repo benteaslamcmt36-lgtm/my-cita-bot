@@ -140,7 +140,7 @@ def check_slots(message):
     if not allowed(message):
         return bot.reply_to(message, "Access nahi hai.")
 
-bot.reply_to(
+    bot.reply_to(
     message,
     "🇪🇸 Cita Facil Espana\n\n"
     "NIE / TIE / Huellas official portal:\n"
