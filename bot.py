@@ -1,14 +1,19 @@
-
-  
 import os
 import logging
+
 import telebot
-from flask import Flask, request, abort
+from flask import Flask, request
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("citabot")
 
-TOKEN = os.environ.get('BOT_TOKEN')
-BOT_URL = (os.environ.get('BOT_URL') or '').rstrip('/')   # strip trailing slash
+# ---------------------------------------------------------------- config
+TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+BOT_URL = (os.environ.get("BOT_URL") or "").strip().rstrip("/")
+ADMIN_ID = (os.environ.get("ADMIN_ID") or "").strip()  # optional
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is missing")
@@ -16,16 +21,42 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
-CLIENTS_DATA = {}
+CLIENTS_DATA = {}       # client_id -> text (memory only: lost on restart)
+WAITING_CLIENT = set()  # chat ids that are in the middle of /addclient
 
 
-@app.route('/' + TOKEN, methods=['POST'])
-def get_message():
-    if request.headers.get('content-type') != 'application/json':
-        abort(403)
-    update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
-    bot.process_new_updates([update])
-    return "!", 200
+def allowed(message):
+    """If ADMIN_ID is set, only that chat may use the bot."""
+    return (not ADMIN_ID) or str(message.chat.id) == ADMIN_ID
+
+
+# ---------------------------------------------------------------- webhook
+def configure_webhook():
+    if not BOT_URL:
+        log.warning("BOT_URL missing - webhook not set")
+        return False
+    try:
+        bot.remove_webhook()
+        ok = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}", drop_pending_updates=True)
+        log.info("Webhook set to %s/<token> -> %s", BOT_URL, ok)
+        return ok
+    except Exception:
+        log.exception("Could not set webhook")
+        return False
+
+
+@app.route("/" + TOKEN, methods=["POST"])
+def receive_update():
+    raw = request.get_data(as_text=True)
+    log.info("📩 POST received from Telegram (%d bytes)", len(raw))
+    try:
+        update = telebot.types.Update.de_json(raw)
+        log.info("✅ update_id=%s -> sending to handlers", update.update_id)
+        bot.process_new_updates([update])
+    except Exception:
+        log.exception("❌ Error while processing update")
+    # Always answer 200 so Telegram does not keep retrying the same update
+    return "OK", 200
 
 
 @app.route("/")
@@ -34,58 +65,113 @@ def index():
 
 
 @app.route("/setwebhook")
-def set_webhook():
+def set_webhook_route():
     if not BOT_URL:
         return "Bot URL missing.", 200
-    bot.remove_webhook()
-    ok = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}")
-    return f"Webhook set: {ok}", 200
+    return f"Webhook set: {configure_webhook()}", 200
 
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "🇪🇸 Cita Fácil España Bot Active Hai! 🇪🇸\n\n"
-        "👉 /addclient - Client ka data andar save karne ke liye\n"
-        "👉 /viewclients - Saved clients ka data dekhne ke liye\n"
-        "👉 /checkslots - Extranjería slots tracking aur alert check karne ke liye"
-    )
-    bot.reply_to(message, welcome_text)
-
-
-@bot.message_handler(commands=['addclient'])
-def add_client(message):
-    msg = bot.reply_to(message, "Client ka Naam aur NIE number likhein (Format: Name, NIE, City):")
-    bot.register_next_step_handler(msg, save_client_step)
-
-
-def save_client_step(message):
+@app.route("/webhookinfo")
+def webhook_info_route():
+    """Shows what Telegram sees, with the token hidden."""
     try:
-        client_id = len(CLIENTS_DATA) + 1
-        CLIENTS_DATA[client_id] = message.text
-        bot.reply_to(message, f"✅ Data andar save ho gaya hai!\n📋 Details: {message.text}")
-    except Exception:
-        logging.exception("save_client_step failed")
-        bot.reply_to(message, "❌ Data save karne mein galti hui.")
+        info = bot.get_webhook_info()
+        url = (info.url or "").replace(TOKEN, "<TOKEN>")
+        return (
+            f"url: {url}\n"
+            f"pending_update_count: {info.pending_update_count}\n"
+            f"last_error_date: {info.last_error_date}\n"
+            f"last_error_message: {info.last_error_message}\n"
+        ), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as e:
+        log.exception("get_webhook_info failed")
+        return f"Error: {e}", 500
 
 
-@bot.message_handler(commands=['viewclients'])
-def view_clients(message):
-    if CLIENTS_DATA:
-        list_data = "\n".join(f"👤 {cid}: {details}" for cid, details in CLIENTS_DATA.items())
-        bot.reply_to(message, f"📋 Aapka Saved Data:\n\n{list_data}")
-    else:
-        bot.reply_to(message, "📭 Abhi andar koi data save nahi hai.")
+# ---------------------------------------------------------------- handlers
+@bot.message_handler(commands=["myid"])
+def my_id(message):
+    log.info("handler: /myid")
+    bot.reply_to(message, f"Aapki chat ID: {message.chat.id}")
 
 
-@bot.message_handler(commands=['checkslots'])
-def check_slots(message):
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+    log.info("handler: /start or /help")
+    if not allowed(message):
+        return bot.reply_to(message, "⛔ Access nahi hai.")
     bot.reply_to(
         message,
-        "🔔 ALERT: Spain Extranjería Website Par Slot Khul Gaya Hai! 🔔\n"
-        "⚡ Bot aapka saved data backend se utha kar process kar raha..."
+        "🇪🇸 Cita Fácil España Bot Active Hai! 🇪🇸\n\n"
+        "👉 /addclient - Client ka data save karne ke liye\n"
+        "👉 /viewclients - Saved clients dekhne ke liye\n"
+        "👉 /checkslots - Slots alert check karne ke liye\n"
+        "👉 /cancel - Chal rahi entry rokne ke liye",
     )
 
 
+@bot.message_handler(commands=["addclient"])
+def add_client(message):
+    log.info("handler: /addclient")
+    if not allowed(message):
+        return bot.reply_to(message, "⛔ Access nahi hai.")
+    WAITING_CLIENT.add(message.chat.id)
+    bot.reply_to(message, "Client ka data likhein (Format: Name, NIE, City):")
+
+
+@bot.message_handler(commands=["cancel"])
+def cancel(message):
+    WAITING_CLIENT.discard(message.chat.id)
+    bot.reply_to(message, "Theek hai, cancel kar diya.")
+
+
+@bot.message_handler(commands=["viewclients"])
+def view_clients(message):
+    log.info("handler: /viewclients")
+    if not allowed(message):
+        return bot.reply_to(message, "⛔ Access nahi hai.")
+    if CLIENTS_DATA:
+        lines = "\n".join(f"👤 {cid}: {d}" for cid, d in CLIENTS_DATA.items())
+        bot.reply_to(message, f"📋 Aapka Saved Data:\n\n{lines}")
+    else:
+        bot.reply_to(message, "📭 Abhi koi data save nahi hai.")
+
+
+@bot.message_handler(commands=["checkslots"])
+def check_slots(message):
+    log.info("handler: /checkslots")
+    if not allowed(message):
+        return bot.reply_to(message, "⛔ Access nahi hai.")
+    bot.reply_to(
+        message,
+        "🔔 TEST ALERT: Yeh sirf simulation hai, asli slot check abhi nahi hai. 🔔",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.id in WAITING_CLIENT
+    and m.content_type == "text"
+    and not m.text.startswith("/")
+)
+def save_client(message):
+    log.info("handler: save client entry")
+    parts = [p.strip() for p in message.text.split(",")]
+    if len(parts) != 3 or not all(parts):
+        return bot.reply_to(message, "Format galat hai. Dobara likhein: Name, NIE, City")
+    client_id = len(CLIENTS_DATA) + 1
+    CLIENTS_DATA[client_id] = message.text
+    WAITING_CLIENT.discard(message.chat.id)
+    bot.reply_to(message, f"✅ Save ho gaya!\n📋 {message.text}")
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    log.info("handler: fallback")
+    bot.reply_to(message, "Samajh nahi aaya. /start dabayein.")
+
+
+# Set the webhook once when the app starts (works with gunicorn and python)
+configure_webhook()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
