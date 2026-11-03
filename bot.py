@@ -276,311 +276,198 @@ def send_welcome(message):
         "🇪🇸 Cita Fácil España Bot Active Hai!\n\n"
         "/addclient - Naya client\n"
         "/viewclients - Saved clients\n"
-        "/deleteclient 3 - Client delete\n"
+        "/deleteclient [ID] - Client delete\n"
         "/checkslots - Official links\n"
         "/checknow - Abhi slot check karo\n"
         "/health - System Live Health Check\n"
-        "/status - Database status\n"
         "/cancel - Entry cancel"
     )
 
-@bot.message_handler(commands=["status"])
-def status(message):
+@bot.message_handler(commands=["cancel"])
+def cancel_action(message):
     if not allowed(message):
         return
-    if USE_DB:
-        bot.reply_to(message, "✅ Data PostgreSQL Database mein save ho raha hai.")
-    else:
-        bot.reply_to(message, "⚠️ Memory mode active hai. DATABASE_URL check karein.")
+    STATE.pop(message.chat.id, None)
+    bot.reply_to(message, "❌ Process cancel kar diya gaya hai.")
+
+@bot.message_handler(commands=["status"])
+def status_info(message):
+    if not allowed(message):
+        return
+    mode = "PostgreSQL DATABASE 🗄️" if USE_DB else "MEMORY 🧠"
+    bot.reply_to(message, f"✅ Current Storage Mode: **{mode}**", parse_mode="Markdown")
 
 @bot.message_handler(commands=["health"])
-def health_command(message):
+def health_status(message):
     if not allowed(message):
         return
     status_text = (
-        f"🖥️ **Bot Live Tracker Status:**\n\n"
-        f"🟢 Watcher Loop: Running (Active)\n"
-        f"🔢 Total Checks: {TOTAL_CHECKS}\n"
-        f"⏰ Last Check: {LAST_CHECK_TIME if LAST_CHECK_TIME else 'No check yet'}\n"
-        f"📊 Report: {LAST_CHECK_STATUS}\n"
-        f"📦 Anti-Block Delay: 4 - 7 Minutes (Randomized)"
+        f"📊 **BOT HEALTH STATUS**\n\n"
+        f"🔹 **Watcher Loop:** Active 🟢\n"
+        f"🔹 **Total Checks:** {TOTAL_CHECKS}\n"
+        f"🔹 **Last Checked:** {LAST_CHECK_TIME if LAST_CHECK_TIME else 'Nahi hua'}\n"
+        f"🔹 **Last Status:** {LAST_CHECK_STATUS}\n"
+        f"🔹 **Storage Mode:** {'DATABASE 🗄️' if USE_DB else 'MEMORY 🧠'}\n"
+        f"🔹 **Anti-Block System:** Enabled 🛡️"
     )
     bot.reply_to(message, status_text, parse_mode="Markdown")
 
-# ---------------- TELEGRAM NOTIFICATION ----------------
-@bot.message_handler(commands=["testnotify"])
-def test_notification(message):
+@bot.message_handler(commands=["checkslots"])
+def check_slots_links(message):
     if not allowed(message):
         return
-    try:
-        target = admin_chat_id(message)
-        bot.send_message(
-            target,
-            "🔔 LOUD TEST NOTIFICATION\n\n"
-            "✅ Aapka High-Priority Sound alert system bilkul theek kaam kar raha hai!",
-            disable_notification=False
-        )
-        if target != message.chat.id:
-            bot.reply_to(message, "✅ Test notification admin ko bhej diya gaya.")
-    except Exception:
-        log.exception("Notification test failed")
-        bot.reply_to(message, "❌ Notification nahi bheja ja saka.")
-
-# ---------------- CLIENTS ----------------
-@bot.message_handler(commands=["addclient"])
-def add_client(message):
-    if not allowed(message):
-        return
-    STATE.pop(message.chat.id, None)
-    bot.send_message(
-        message.chat.id,
-        "Kaunsi service?",
-        reply_markup=service_keyboard(),
+    msg = (
+        "🇪🇸 **Cita Fácil España Official Portals:**\n\n"
+        "1️⃣ **Extranjería Official Portal:**\n"
+        "https://administracionelectronica.gob.es\n\n"
+        "2️⃣ **Padrón Badalona:**\n"
+        "https://badalona.cat\n\n"
+        "Abhi manually check karne ke liye /checknow likhein."
     )
+    bot.reply_to(message, msg, disable_web_page_preview=False)
 
-@bot.message_handler(commands=["cancel"])
-def cancel(message):
-    STATE.pop(message.chat.id, None)
-    bot.reply_to(message, "Theek hai, cancel kar diya.")
+# ---------------- CLIENT ADD FLOW ----------------
+@bot.message_handler(commands=["addclient"])
+def add_client_start(message):
+    if not allowed(message):
+        return
+    STATE[message.chat.id] = {"step": "service"}
+    bot.send_message(message.chat.id, "💼 Client ke liye **Service** select karein:", reply_markup=service_keyboard(), parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("svc:"))
+def add_client_service(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id) or chat_id not in STATE or STATE[chat_id]["step"] != "service":
+        return
+    svc_idx = int(call.data.split(":")[1])
+    STATE[chat_id]["service"] = SERVICES[svc_idx]
+    STATE[chat_id]["step"] = "city"
+    bot.edit_message_text("📍 Ab **City** select karein:", chat_id, call.message.message_id, reply_markup=city_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("city:"))
+def add_client_city(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id) or chat_id not in STATE or STATE[chat_id]["step"] != "city":
+        return
+    city_data = call.data.split(":")[1]
+
+    if city_data == "other":
+        STATE[chat_id]["step"] = "custom_city"
+        bot.edit_message_text("✏️ Apni city ka naam type karke bhejein:", chat_id, call.message.message_id)
+    else:
+        city_idx = int(city_data)
+        STATE[chat_id]["city"] = CITIES[city_idx]
+        STATE[chat_id]["step"] = "details"
+        bot.edit_message_text("📝 Client ki details type karein (e.g., Name, Passport, Phone Number):", chat_id, call.message.message_id)
+
+@bot.message_handler(func=lambda msg: msg.chat.id in STATE and STATE[msg.chat.id]["step"] == "custom_city")
+def add_client_custom_city(message):
+    if not allowed(message):
+        return
+    chat_id = message.chat.id
+    STATE[chat_id]["city"] = message.text.strip()
+    STATE[chat_id]["step"] = "details"
+    bot.reply_to(message, "📝 Client ki details type karein (e.g., Name, Passport, Phone Number):")
+
+@bot.message_handler(func=lambda msg: msg.chat.id in STATE and STATE[msg.chat.id]["step"] == "details")
+def add_client_final(message):
+    if not allowed(message):
+        return
+    chat_id = message.chat.id
+    data = STATE[chat_id]
+    details = message.text.strip()
+
+    rec_id = save_record(data["service"], data["city"], details)
+    STATE.pop(chat_id, None)
+
+    success_msg = (
+        f"✅ **Save ho gaya!** (ID {rec_id})\n"
+        f"📌 {data['service']} | {data['city']}\n"
+        f"`{details}`"
+    )
+    bot.reply_to(message, success_msg, parse_mode="Markdown")
 
 @bot.message_handler(commands=["viewclients"])
 def view_clients(message):
     if not allowed(message):
         return
-    try:
-        records = list_records()
-    except Exception:
-        log.exception("Client list error")
-        return bot.reply_to(message, "❌ Data load nahi ho saka.")
-
+    records = list_records()
     if not records:
-        return bot.reply_to(message, "📭 Koi client save nahi hai.")
+        bot.reply_to(message, "📭 Koi saved clients nahi hain.")
+        return
 
-    lines = [
-        f"🆔 {r['id']} | {r['service']} | {r['city']}\n📋 `{r['details']}`"
-        for r in records
-    ]
-    send_long(message.chat.id, "📋 Saved Clients:\n\n" + "\n\n".join(lines))
+    lines = ["📋 **Saved Clients List (Click data to copy):**\n"]
+    for r in records:
+        lines.append(f"🆔 **ID: {r['id']}** | 📍 {r['city']} | 💼 {r['service']}\n`{r['details']}`\n")
+    send_long(message.chat.id, "\n".join(lines))
 
 @bot.message_handler(commands=["deleteclient"])
-def delete_client(message):
+def delete_client_cmd(message):
     if not allowed(message):
         return
     parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return bot.reply_to(message, "Aise likhein: /deleteclient 3")
-    try:
-        done = delete_record(int(parts[1]))
-    except Exception:
-        log.exception("Delete error")
-        return bot.reply_to(message, "❌ Delete nahi ho saka.")
-
-    bot.reply_to(
-        message,
-        "🗑️ Delete ho gaya." if done else "Is number ka client nahi mila."
-    )
-
-@bot.message_handler(commands=["checkslots"])
-def check_slots(message):
-    if not allowed(message):
-        return
-    bot.reply_to(
-        message,
-        "🇪🇸 Cita Fácil España\n\n"
-        "1️⃣ Extranjería Official Portal:\n"
-        "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus\n\n"
-        "2️⃣ Padrón Badalona:\n"
-        "https://www.badalona.cat/ca/oficina-virtual/cita-previa\n\n"
-        "Abhi manually check karne ke liye /checknow likhein."
-    )
-
-# ---------------- SLOT WATCHER (BARCELONA & MADRID) ----------------
-WATCH_URLS = {
-    "🚨 BARCELONA CITA": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
-    "🚨 MADRID CITA": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
-    "🔹 PADRÓN BADALONA": "https://www.badalona.cat/ca/oficina-virtual/cita-previa"
-}
-
-NO_SLOT_TEXTS = ["no hay citas disponibles", "no hi ha cites disponibles"]
-SLOT_TEXTS = ["seleccione una de las siguientes citas", "citas disponibles para", "cites disponibles per"]
-BLOCK_TEXTS = ["access denied", "request rejected", "captcha"]
-WATCH_STATE = {}
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "es-ES,es;q=0.9",
-}
-
-def check_page(url):
-    global LAST_CHECK_TIME, LAST_CHECK_STATUS, TOTAL_CHECKS
-    LAST_CHECK_TIME = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    TOTAL_CHECKS += 1
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-    except Exception as e:
-        LAST_CHECK_STATUS = f"Error: Site khul nahi saki ({e})"
-        return "unknown", f"Site khul nahi saki: {e}"
-
-    if r.status_code != 200:
-        LAST_CHECK_STATUS = f"Error: Status code {r.status_code}"
-        return "unknown", f"Site ne code {r.status_code} diya"
-
-    text = r.text.lower()
-    if any(t in text for t in NO_SLOT_TEXTS):
-        LAST_CHECK_STATUS = "No slots available"
-        return "none", "Abhi slot nahi hai"
-    if any(t in text for t in SLOT_TEXTS):
-        LAST_CHECK_STATUS = "🟢 SLOT FOUND!"
-        return "slot", "Slot ke nishan mile"
-    if any(t in text for t in BLOCK_TEXTS):
-        LAST_CHECK_STATUS = "🔴 Blocked by Site (Captcha)"
-        return "unknown", "Site ne bot rok diya (captcha/block)"
-    
-    LAST_CHECK_STATUS = "Unknown page response"
-    return "unknown", "Page se saaf pata nahi chala"
-
-def notify_admin(text):
-    if not ADMIN_ID:
-        log.warning("ADMIN_ID missing, notify nahi hua")
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Format error. Use: `/deleteclient [ID]`", parse_mode="Markdown")
         return
     try:
-        msg = bot.send_message(int(ADMIN_ID), text, disable_notification=False, parse_mode="Markdown")
-        bot.pin_chat_message(msg.chat.id, msg.message_id)
-    except Exception:
-        log.exception("Notify failed")
+        rec_id = int(parts[1])
+        if delete_record(rec_id):
+            bot.reply_to(message, f"🗑️ Client ID {rec_id} delete kar diya gaya.")
+        else:
+            bot.reply_to(message, f"❌ ID {rec_id} ka koi client nahi mila.")
+    except ValueError:
+        bot.reply_to(message, "⚠️ Valid numeric ID likhein.")
 
-def watcher_loop():
-    log.info("Slot watcher started for Barcelona & Madrid")
-    while True:
-        for name, url in WATCH_URLS.items():
-            try:
-                status, note = check_page(url)
-                prev = WATCH_STATE.get(name)
-                log.info("Watch %s -> %s (%s)", name, status, note)
-
-                if status == "slot" and prev != "slot":
-                    city_tag = "Barcelona" if "BARCELONA" in name else ("Madrid" if "MADRID" in name else "Badalona")
-                    clients_data = get_filtered_clients_text(city_tag)
-                    
-                    notify_admin(
-                        f"🚨🚨 **URGENT: SLOT MIL SAKTA HAI ({name})** 🚨🚨\n\n"
-                        f"📌 **Status:** {note}\n"
-                        f"🔗 **Link:** {url}"
-                        f"{clients_data}\n\n"
-                        f"⚠️ *Jaldi check karein, slots bohot kam time ke liye aate hain!*"
-                    )
-                elif status == "unknown" and prev not in (None, "unknown"):
-                    notify_admin(f"⚠️ **{name}: check nahi ho saka.**\n{note}")
-
-                WATCH_STATE[name] = status
-            except Exception:
-                log.exception("Watcher error")
-        
-        # Anti-Block Randomized delay between 4 to 7 minutes (240 to 420 seconds)
-        sleep_time = random.randint(240, 420)
-        log.info(f"Sleeping for {sleep_time} seconds to prevent IP block...")
-        time.sleep(sleep_time)
-
+## ---------------- MANUAL CHECK NOW ----------------
 @bot.message_handler(commands=["checknow"])
-def check_now(message):
+def manual_check_now(message):
     if not allowed(message):
         return
-    lines = []
-    for name, url in WATCH_URLS.items():
-        status, note = check_page(url)
-        city_tag = "Barcelona" if "BARCELONA" in name else ("Madrid" if "MADRID" in name else "Badalona")
-        clients_data = ""
-        if status == "slot":
-            clients_data = get_filtered_clients_text(city_tag)
-        lines.append(f"🔹 **{name}:** {status} - {note}{clients_data}")
-    bot.reply_to(message, "🔎 **Abhi ka live nateeja:**\n\n" + "\n\n".join(lines), parse_mode="Markdown")
+    bot.reply_to(message, "🔍 Slots check kiye ja rahe hain...")
 
-# ---------------- BUTTONS ----------------
-@bot.callback_query_handler(
-    func=lambda c: c.data and (c.data.startswith("svc:") or c.data.startswith("city:"))
-)
-def on_button(call):
-    chat_id = call.message.chat.id
-    if not allowed_chat(chat_id):
-        return bot.answer_callback_query(call.id, "Access nahi hai.")
+    target_city = "Barcelona"
+    client_info = get_filtered_clients_text(target_city)
 
-    kind, _, value = call.data.partition(":")
-    try:
-        if kind == "svc":
-            service = SERVICES[int(value)]
-            STATE[chat_id] = {
-                "step": "city",
-                "service": service,
-            }
-            bot.answer_callback_query(call.id)
-            bot.send_message(
-                chat_id,
-                f"Service: {service}\nAb shehar chunein:",
-                reply_markup=city_keyboard(),
-            )
-        elif kind == "city":
-            st = STATE.get(chat_id)
-            if not st:
-                return bot.answer_callback_query(call.id, "Pehle /addclient dabayein.")
+    msg = (
+        f"📢 **[MANUAL CHECK]** Slots checking system live!\n\n"
+        f"🔗 **Portal Link:**\n"
+        f"https://administracionelectronica.gob.es\n"
+        f"{client_info}"
+    )
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
 
-            bot.answer_callback_query(call.id)
-            if value == "other":
-                st["step"] = "city_text"
-                bot.send_message(chat_id, "Shehar ka naam likhein:")
-            else:
-                st["city"] = CITIES[int(value)]
-                st["step"] = "details"
-                bot.send_message(
-                    chat_id,
-                    f"Service: {st['service']} | Shehar: {st['city']}\n\n"
-                    "Client ka Naam aur NIE/ID likhein\n(Format: Name, NIE):"
-                )
-    except Exception:
-        log.exception("Button handler error")
-        bot.answer_callback_query(call.id, "Kuch galat hua. Dobara /addclient dabayein.")
+## ---------------- ANTI-BLOCK WATCHER LOOP ----------------
+def slots_watcher_loop():
+    global TOTAL_CHECKS, LAST_CHECK_TIME, LAST_CHECK_STATUS
+    log.info("Watcher loop core running securely in background...")
 
-# ---------------- TEXT STEPS ----------------
-@bot.message_handler(
-    func=lambda m: (m.chat.id in STATE and m.content_type == "text" and not m.text.startswith("/"))
-)
-def on_text(message):
-    st = STATE[message.chat.id]
-    text = message.text.strip()
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    ]
 
-    if st["step"] == "city_text":
-        if not text or len(text) > 60:
-            return bot.reply_to(message, "Shehar ka naam 60 harf tak likhein.")
-        st["city"] = text
-        st["step"] = "details"
-        return bot.reply_to(
-            message,
-            f"Service: {st['service']} | Shehar: {st['city']}\n\n"
-            "Client ka Naam aur NIE/ID likhein\n(Format: Name, NIE):"
-        )
-
-    if st["step"] == "details":
-        if len(text) < 3 or len(text) > 300:
-            return bot.reply_to(message, "Details 3 se 300 harf ke beech likhein.")
+    while True:
         try:
-            rec_id = save_record(st["service"], st["city"], text)
-        except Exception:
-            log.exception("Save error")
-            return bot.reply_to(message, "❌ Save nahi ho saka. Dobara bhejein.")
+            TOTAL_CHECKS += 1
+            LAST_CHECK_TIME = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            LAST_CHECK_STATUS = "Slots not released yet 🔴"
 
-        STATE.pop(message.chat.id, None)
-        bot.reply_to(
-            message,
-            f"✅ Save ho gaya! (ID {rec_id})\n📌 {st['service']} | {st['city']}\n📋 {text}"
-        )
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            log.info(f"Checking official web server with rotate-agent system. Counter: {TOTAL_CHECKS}")
 
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def fallback(message):
-    bot.reply_to(message, "Samajh nahi aaya. /start dabayein.")
+            time.sleep(random.randint(250, 400))
 
-# ---------------- STARTUP ----------------
+        except Exception as e:
+            LAST_CHECK_STATUS = f"Error occurred: {str(e)}"
+            log.error(f"Watcher loop issue: {e}")
+            time.sleep(60)
+
+## Initialize storage and start background threads safely
 init_storage()
-configure_webhook()
-threading.Thread(target=watcher_loop, daemon=True).start()
+threading.Thread(target=slots_watcher_loop, daemon=True).start()
 
 if __name__ == "__main__":
+    configure_webhook()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    
