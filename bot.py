@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import threading
-
 import requests
 import telebot
 from telebot import types
@@ -20,7 +19,6 @@ logging.basicConfig(
 log = logging.getLogger("citabot")
 
 # ---------------- CONFIG ----------------
-
 TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 BOT_URL = (os.environ.get("BOT_URL") or "").strip().rstrip("/")
 ADMIN_ID = (os.environ.get("ADMIN_ID") or "").strip()
@@ -33,7 +31,6 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
 SERVICES = ["NIE", "TIE", "Huellas", "Padrón"]
-
 CITIES = [
     "Barcelona",
     "Madrid",
@@ -52,38 +49,26 @@ USE_DB = False
 MEMORY = []
 MEMORY_NEXT_ID = 1
 
-
 # ---------------- ACCESS ----------------
-
 def allowed_chat(chat_id):
     return (not ADMIN_ID) or str(chat_id) == ADMIN_ID
 
-
 def allowed(message):
     return allowed_chat(message.chat.id)
-
 
 def admin_chat_id(message):
     if ADMIN_ID:
         return int(ADMIN_ID)
     return message.chat.id
 
-
 # ---------------- DATABASE ----------------
-
-def db_conn():
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
-
-
 def init_storage():
     global USE_DB
-
     if not DATABASE_URL or psycopg2 is None:
         log.warning("Database not configured -> MEMORY mode")
         return
-
     try:
-        conn = db_conn()
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         try:
             with conn, conn.cursor() as cur:
                 cur.execute("""
@@ -97,28 +82,25 @@ def init_storage():
                 """)
         finally:
             conn.close()
-
         USE_DB = True
         log.info("Database connected -> DATABASE mode")
-
     except Exception:
         log.exception("Database connection failed")
         USE_DB = False
 
-
 def save_record(service, city, details):
     global MEMORY_NEXT_ID
-
     if USE_DB:
-        conn = db_conn()
         try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             with conn, conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO clients (service, city, details) "
                     "VALUES (%s, %s, %s) RETURNING id",
                     (service, city, details),
                 )
-                return cur.fetchone()[0]
+                res = cur.fetchone()[0]
+                return res
         finally:
             conn.close()
 
@@ -132,11 +114,10 @@ def save_record(service, city, details):
     MEMORY.append(rec)
     return rec["id"]
 
-
 def list_records():
     if USE_DB:
-        conn = db_conn()
         try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             with conn, conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, service, city, details "
@@ -153,14 +134,12 @@ def list_records():
                 ]
         finally:
             conn.close()
-
     return list(MEMORY)
-
 
 def delete_record(rec_id):
     if USE_DB:
-        conn = db_conn()
         try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             with conn, conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM clients WHERE id = %s",
@@ -174,53 +153,40 @@ def delete_record(rec_id):
         if rec["id"] == rec_id:
             del MEMORY[i]
             return True
-
     return False
 
-
 # ---------------- HELPERS ----------------
-
 def send_long(chat_id, text):
     while text:
         chunk, text = text[:3800], text[3800:]
         bot.send_message(chat_id, chunk)
 
-
 def service_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(*[
-        types.InlineKeyboardButton(
-            s, callback_data=f"svc:{i}"
-        )
+        types.InlineKeyboardButton(s, callback_data=f"svc:{i}")
         for i, s in enumerate(SERVICES)
     ])
     return kb
 
-
 def city_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(*[
-        types.InlineKeyboardButton(
-            c, callback_data=f"city:{i}"
-        )
+        types.InlineKeyboardButton(c, callback_data=f"city:{i}")
         for i, c in enumerate(CITIES)
     ])
     kb.add(
         types.InlineKeyboardButton(
-            "✏️ Dusra shehar (likhein)",
-            callback_data="city:other",
+            "✏️ Dusra shehar (likhein)", callback_data="city:other"
         )
     )
     return kb
 
-
 # ---------------- WEBHOOK ----------------
-
 def configure_webhook():
     if not BOT_URL:
         log.warning("BOT_URL missing")
         return False
-
     try:
         bot.remove_webhook()
         ok = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}")
@@ -230,66 +196,49 @@ def configure_webhook():
         log.exception("Webhook setup failed")
         return False
 
-
 @app.route("/" + TOKEN, methods=["POST"])
 def receive_update():
     raw = request.get_data(as_text=True)
-
     try:
         update = telebot.types.Update.de_json(raw)
         bot.process_new_updates([update])
     except Exception:
         log.exception("Webhook update error")
-
     return "OK", 200
-
 
 @app.route("/")
 def index():
     return "System Active Aur Ready Hai!", 200
 
-
 @app.route("/setwebhook")
 def set_webhook_route():
     return f"Webhook set: {configure_webhook()}", 200
-
 
 @app.route("/webhookinfo")
 def webhook_info_route():
     try:
         info = bot.get_webhook_info()
         url = (info.url or "").replace(TOKEN, "<TOKEN>")
-
         return (
             f"url: {url}\n"
             f"pending_update_count: {info.pending_update_count}\n"
             f"last_error_date: {info.last_error_date}\n"
             f"last_error_message: {info.last_error_message}\n"
             f"storage: {'DATABASE' if USE_DB else 'MEMORY'}\n"
-        ), 200, {
-            "Content-Type": "text/plain; charset=utf-8"
-        }
-
+        ), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
         log.exception("Webhook info error")
         return f"Error: {e}", 500
 
-
 # ---------------- COMMANDS ----------------
-
 @bot.message_handler(commands=["myid"])
 def my_id(message):
-    bot.reply_to(
-        message,
-        f"Aapki chat ID: {message.chat.id}"
-    )
-
+    bot.reply_to(message, f"Aapki chat ID: {message.chat.id}")
 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     bot.reply_to(
         message,
         "🇪🇸 Cita Fácil España Bot Active Hai!\n\n"
@@ -303,84 +252,55 @@ def send_welcome(message):
         "/cancel - Entry cancel"
     )
 
-
 @bot.message_handler(commands=["status"])
 def status(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     if USE_DB:
-        bot.reply_to(
-            message,
-            "✅ Data PostgreSQL Database mein save ho raha hai."
-        )
+        bot.reply_to(message, "✅ Data PostgreSQL Database mein save ho raha hai.")
     else:
-        bot.reply_to(
-            message,
-            "⚠️ Memory mode active hai. DATABASE_URL check karein."
-        )
-
+        bot.reply_to(message, "⚠️ Memory mode active hai. DATABASE_URL check karein.")
 
 # ---------------- TELEGRAM NOTIFICATION ----------------
-
 @bot.message_handler(commands=["testnotify"])
 def test_notification(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     try:
         target = admin_chat_id(message)
-
         bot.send_message(
             target,
-            "🔔 TEST NOTIFICATION\n\n"
-            "✅ Aapka Telegram notification system kaam kar raha hai!\n\n"
-            "🇪🇸 Cita Previa Alert System\n"
-            "Admin notification successfully tested."
+            "🔔 LOUD TEST NOTIFICATION\n\n"
+            "✅ Aapka High-Priority Sound alert system bilkul theek kaam kar raha hai!",
+            disable_notification=False
         )
-
         if target != message.chat.id:
-            bot.reply_to(
-                message,
-                "✅ Test notification admin ko bhej diya gaya."
-            )
-
+            bot.reply_to(message, "✅ Test notification admin ko bhej diya gaya.")
     except Exception:
         log.exception("Notification test failed")
-        bot.reply_to(
-            message,
-            "❌ Notification nahi bheja ja saka. "
-            "ADMIN_ID aur Telegram settings check karein."
-        )
-
+        bot.reply_to(message, "❌ Notification nahi bheja ja saka.")
 
 # ---------------- CLIENTS ----------------
-
 @bot.message_handler(commands=["addclient"])
 def add_client(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     STATE.pop(message.chat.id, None)
-
     bot.send_message(
         message.chat.id,
         "Kaunsi service?",
         reply_markup=service_keyboard(),
     )
 
-
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
     STATE.pop(message.chat.id, None)
     bot.reply_to(message, "Theek hai, cancel kar diya.")
 
-
 @bot.message_handler(commands=["viewclients"])
 def view_clients(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     try:
         records = list_records()
     except Exception:
@@ -391,30 +311,18 @@ def view_clients(message):
         return bot.reply_to(message, "📭 Koi client save nahi hai.")
 
     lines = [
-        f"🆔 {r['id']} | {r['service']} | {r['city']}\n"
-        f"    {r['details']}"
+        f"🆔 {r['id']} | {r['service']} | {r['city']}\n {r['details']}"
         for r in records
     ]
-
-    send_long(
-        message.chat.id,
-        "📋 Saved Clients:\n\n" + "\n\n".join(lines)
-    )
-
+    send_long(message.chat.id, "📋 Saved Clients:\n\n" + "\n\n".join(lines))
 
 @bot.message_handler(commands=["deleteclient"])
 def delete_client(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     parts = message.text.split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-        return bot.reply_to(
-            message,
-            "Aise likhein: /deleteclient 3"
-        )
-
+        return bot.reply_to(message, "Aise likhein: /deleteclient 3")
     try:
         done = delete_record(int(parts[1]))
     except Exception:
@@ -423,62 +331,42 @@ def delete_client(message):
 
     bot.reply_to(
         message,
-        "🗑️ Delete ho gaya." if done
-        else "Is number ka client nahi mila."
+        "🗑️ Delete ho gaya." if done else "Is number ka client nahi mila."
     )
-
 
 @bot.message_handler(commands=["checkslots"])
 def check_slots(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     bot.reply_to(
         message,
-        "🇪🇸 Cita Facil Espana\n\n"
-        "Extranjería official portal:\n"
-        "https://sede.administracionespublicas.gob.es/"
-        "pagina/index/directorio/icpplus\n\n"
-        "Padron appointments (Badalona):\n"
+        "🇪🇸 Cita Fácil España\n\n"
+        "1️⃣ Extranjería Official Portal:\n"
+        "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus\n\n"
+        "2️⃣ Padrón Badalona:\n"
         "https://www.badalona.cat/ca/oficina-virtual/cita-previa\n\n"
-        "Automatic checking ke liye /checknow dabayein."
+        "Abhi manually check karne ke liye /checknow likhein."
     )
 
-
-# ---------------- SLOT WATCHER ----------------
-
+# ---------------- SLOT WATCHER (BARCELONA & MADRID) ----------------
 WATCH_URLS = {
-    "Extranjería": (
-        "https://sede.administracionespublicas.gob.es/"
-        "pagina/index/directorio/icpplus"
-    ),
-    "Padrón Badalona": (
-        "https://www.badalona.cat/ca/oficina-virtual/cita-previa"
-    ),
+    "🚨 BARCELONA CITA": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
+    "🚨 MADRID CITA": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
+    "🔹 PADRÓN BADALONA": "https://www.badalona.cat/ca/oficina-virtual/cita-previa"
 }
-CHECK_EVERY = 300  # seconds (5 minutes)
 
-NO_SLOT_TEXTS = [
-    "no hay citas disponibles",
-    "no hi ha cites disponibles",
-]
-SLOT_TEXTS = [
-    "seleccione una de las siguientes citas",
-    "citas disponibles para",
-    "cites disponibles per",
-]
+CHECK_EVERY = 300  # 5 Minutes
+NO_SLOT_TEXTS = ["no hay citas disponibles", "no hi ha cites disponibles"]
+SLOT_TEXTS = ["seleccione una de las siguientes citas", "citas disponibles para", "cites disponibles per"]
 BLOCK_TEXTS = ["access denied", "request rejected", "captcha"]
-
 WATCH_STATE = {}
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "es-ES,es;q=0.9",
 }
 
-
 def check_page(url):
-    """Returns (status, note). status: slot / none / unknown"""
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
     except Exception as e:
@@ -488,31 +376,26 @@ def check_page(url):
         return "unknown", f"Site ne code {r.status_code} diya"
 
     text = r.text.lower()
-
     if any(t in text for t in NO_SLOT_TEXTS):
         return "none", "Abhi slot nahi hai"
-
     if any(t in text for t in SLOT_TEXTS):
         return "slot", "Slot ke nishan mile"
-
     if any(t in text for t in BLOCK_TEXTS):
         return "unknown", "Site ne bot rok diya (captcha/block)"
-
     return "unknown", "Page se saaf pata nahi chala"
-
 
 def notify_admin(text):
     if not ADMIN_ID:
         log.warning("ADMIN_ID missing, notify nahi hua")
         return
     try:
-        bot.send_message(int(ADMIN_ID), text)
+        msg = bot.send_message(int(ADMIN_ID), text, disable_notification=False)
+        bot.pin_chat_message(msg.chat.id, msg.message_id)
     except Exception:
         log.exception("Notify failed")
 
-
 def watcher_loop():
-    log.info("Slot watcher started")
+    log.info("Slot watcher started for Barcelona & Madrid")
     while True:
         for name, url in WATCH_URLS.items():
             try:
@@ -522,116 +405,76 @@ def watcher_loop():
 
                 if status == "slot" and prev != "slot":
                     notify_admin(
-                        f"🚨 SLOT MIL SAKTA HAI: {name}\n\n"
-                        f"{note}\n"
-                        f"Jaldi kholein:\n{url}\n\n"
-                        "⚠️ Pehle khud dekh kar confirm karein."
+                        f"🚨🚨 URGENT: SLOT MIL SAKTA HAI ({name}) 🚨🚨\n\n"
+                        f"📌 Status: {note}\n"
+                        f"🔗 Link: {url}\n\n"
+                        f"⚠️ Jaldi check karein, slots bohot kam time ke liye aate hain!"
                     )
                 elif status == "unknown" and prev not in (None, "unknown"):
-                    notify_admin(
-                        f"⚠️ {name}: check nahi ho saka.\n{note}"
-                    )
+                    notify_admin(f"⚠️ {name}: check nahi ho saka.\n{note}")
 
                 WATCH_STATE[name] = status
             except Exception:
                 log.exception("Watcher error")
         time.sleep(CHECK_EVERY)
 
-
 @bot.message_handler(commands=["checknow"])
 def check_now(message):
     if not allowed(message):
-        return bot.reply_to(message, "⛔ Access nahi hai.")
-
+        return
     lines = []
     for name, url in WATCH_URLS.items():
         status, note = check_page(url)
-        lines.append(f"{name}: {status} - {note}")
-
-    bot.reply_to(message, "🔎 Abhi ka nateeja:\n\n" + "\n".join(lines))
-
+        lines.append(f"🔹 {name}: {status} - {note}")
+    bot.reply_to(message, "🔎 Abhi ka live nateeja:\n\n" + "\n".join(lines))
 
 # ---------------- BUTTONS ----------------
-
 @bot.callback_query_handler(
-    func=lambda c: c.data and (
-        c.data.startswith("svc:")
-        or c.data.startswith("city:")
-    )
+    func=lambda c: c.data and (c.data.startswith("svc:") or c.data.startswith("city:"))
 )
 def on_button(call):
     chat_id = call.message.chat.id
-
     if not allowed_chat(chat_id):
-        return bot.answer_callback_query(
-            call.id, "Access nahi hai."
-        )
+        return bot.answer_callback_query(call.id, "Access nahi hai.")
 
     kind, _, value = call.data.partition(":")
-
     try:
         if kind == "svc":
             service = SERVICES[int(value)]
-
             STATE[chat_id] = {
                 "step": "city",
                 "service": service,
             }
-
             bot.answer_callback_query(call.id)
-
             bot.send_message(
                 chat_id,
                 f"Service: {service}\nAb shehar chunein:",
                 reply_markup=city_keyboard(),
             )
-
         elif kind == "city":
             st = STATE.get(chat_id)
-
             if not st:
-                return bot.answer_callback_query(
-                    call.id,
-                    "Pehle /addclient dabayein."
-                )
+                return bot.answer_callback_query(call.id, "Pehle /addclient dabayein.")
 
             bot.answer_callback_query(call.id)
-
             if value == "other":
                 st["step"] = "city_text"
-                bot.send_message(
-                    chat_id,
-                    "Shehar ka naam likhein:"
-                )
-
+                bot.send_message(chat_id, "Shehar ka naam likhein:")
             else:
                 st["city"] = CITIES[int(value)]
                 st["step"] = "details"
-
                 bot.send_message(
                     chat_id,
-                    f"Service: {st['service']} | "
-                    f"Shehar: {st['city']}\n\n"
-                    "Client ka Naam aur NIE/ID likhein\n"
-                    "(Format: Name, NIE):"
+                    f"Service: {st['service']} | Shehar: {st['city']}\n\n"
+                    "Client ka Naam aur NIE/ID likhein\n(Format: Name, NIE):"
                 )
-
     except Exception:
         log.exception("Button handler error")
-        bot.answer_callback_query(
-            call.id,
-            "Kuch galat hua. Dobara /addclient dabayein."
-        )
-
+        bot.answer_callback_query(call.id, "Kuch galat hua. Dobara /addclient dabayein.")
 
 # ---------------- TEXT STEPS ----------------
-
 @bot.message_handler(
-    func=lambda m: (
-        m.chat.id in STATE
-        and m.content_type == "text"
-        and not m.text.startswith("/")
-    )
+    func=lambda m: (m.chat.id in STATE and m.content_type == "text" and not m.text.startswith("/"))
 )
 def on_text(message):
     st = STATE[message.chat.id]
@@ -639,72 +482,38 @@ def on_text(message):
 
     if st["step"] == "city_text":
         if not text or len(text) > 60:
-            return bot.reply_to(
-                message,
-                "Shehar ka naam 60 harf tak likhein."
-            )
-
+            return bot.reply_to(message, "Shehar ka naam 60 harf tak likhein.")
         st["city"] = text
         st["step"] = "details"
-
         return bot.reply_to(
             message,
-            f"Service: {st['service']} | "
-            f"Shehar: {st['city']}\n\n"
-            "Client ka Naam aur NIE/ID likhein\n"
-            "(Format: Name, NIE):"
+            f"Service: {st['service']} | Shehar: {st['city']}\n\n"
+            "Client ka Naam aur NIE/ID likhein\n(Format: Name, NIE):"
         )
 
     if st["step"] == "details":
         if len(text) < 3 or len(text) > 300:
-            return bot.reply_to(
-                message,
-                "Details 3 se 300 harf ke beech likhein."
-            )
-
+            return bot.reply_to(message, "Details 3 se 300 harf ke beech likhein.")
         try:
-            rec_id = save_record(
-                st["service"],
-                st["city"],
-                text,
-            )
+            rec_id = save_record(st["service"], st["city"], text)
         except Exception:
             log.exception("Save error")
-            return bot.reply_to(
-                message,
-                "❌ Save nahi ho saka. Dobara bhejein."
-            )
+            return bot.reply_to(message, "❌ Save nahi ho saka. Dobara bhejein.")
 
         STATE.pop(message.chat.id, None)
-
         bot.reply_to(
             message,
-            f"✅ Save ho gaya! (ID {rec_id})\n"
-            f"📌 {st['service']} | {st['city']}\n"
-            f"📋 {text}"
+            f"✅ Save ho gaya! (ID {rec_id})\n📌 {st['service']} | {st['city']}\n📋 {text}"
         )
 
-
-@bot.message_handler(
-    func=lambda m: True,
-    content_types=["text"]
-)
+@bot.message_handler(func=lambda m: True, content_types=["text"])
 def fallback(message):
-    bot.reply_to(
-        message,
-        "Samajh nahi aaya. /start dabayein."
-    )
-
+    bot.reply_to(message, "Samajh nahi aaya. /start dabayein.")
 
 # ---------------- STARTUP ----------------
-
 init_storage()
 configure_webhook()
 threading.Thread(target=watcher_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
-            )
-    
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
