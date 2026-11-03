@@ -1,7 +1,9 @@
-
 import os
+import time
 import logging
+import threading
 
+import requests
 import telebot
 from telebot import types
 from flask import Flask, request
@@ -295,6 +297,7 @@ def send_welcome(message):
         "/viewclients - Saved clients\n"
         "/deleteclient 3 - Client delete\n"
         "/checkslots - Official links\n"
+        "/checknow - Abhi slot check karo\n"
         "/testnotify - Notification test\n"
         "/status - Database status\n"
         "/cancel - Entry cancel"
@@ -438,8 +441,114 @@ def check_slots(message):
         "pagina/index/directorio/icpplus\n\n"
         "Padron appointments (Badalona):\n"
         "https://www.badalona.cat/ca/oficina-virtual/cita-previa\n\n"
-        "⚠️ Automatic slot checking abhi active nahi hai."
+        "Automatic checking ke liye /checknow dabayein."
     )
+
+
+# ---------------- SLOT WATCHER ----------------
+
+WATCH_URLS = {
+    "Extranjería": (
+        "https://sede.administracionespublicas.gob.es/"
+        "pagina/index/directorio/icpplus"
+    ),
+    "Padrón Badalona": (
+        "https://www.badalona.cat/ca/oficina-virtual/cita-previa"
+    ),
+}
+CHECK_EVERY = 300  # seconds (5 minutes)
+
+NO_SLOT_TEXTS = [
+    "no hay citas disponibles",
+    "no hi ha cites disponibles",
+]
+SLOT_TEXTS = [
+    "seleccione una de las siguientes citas",
+    "citas disponibles para",
+    "cites disponibles per",
+]
+BLOCK_TEXTS = ["access denied", "request rejected", "captcha"]
+
+WATCH_STATE = {}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Accept-Language": "es-ES,es;q=0.9",
+}
+
+
+def check_page(url):
+    """Returns (status, note). status: slot / none / unknown"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+    except Exception as e:
+        return "unknown", f"Site khul nahi saki: {e}"
+
+    if r.status_code != 200:
+        return "unknown", f"Site ne code {r.status_code} diya"
+
+    text = r.text.lower()
+
+    if any(t in text for t in NO_SLOT_TEXTS):
+        return "none", "Abhi slot nahi hai"
+
+    if any(t in text for t in SLOT_TEXTS):
+        return "slot", "Slot ke nishan mile"
+
+    if any(t in text for t in BLOCK_TEXTS):
+        return "unknown", "Site ne bot rok diya (captcha/block)"
+
+    return "unknown", "Page se saaf pata nahi chala"
+
+
+def notify_admin(text):
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID missing, notify nahi hua")
+        return
+    try:
+        bot.send_message(int(ADMIN_ID), text)
+    except Exception:
+        log.exception("Notify failed")
+
+
+def watcher_loop():
+    log.info("Slot watcher started")
+    while True:
+        for name, url in WATCH_URLS.items():
+            try:
+                status, note = check_page(url)
+                prev = WATCH_STATE.get(name)
+                log.info("Watch %s -> %s (%s)", name, status, note)
+
+                if status == "slot" and prev != "slot":
+                    notify_admin(
+                        f"🚨 SLOT MIL SAKTA HAI: {name}\n\n"
+                        f"{note}\n"
+                        f"Jaldi kholein:\n{url}\n\n"
+                        "⚠️ Pehle khud dekh kar confirm karein."
+                    )
+                elif status == "unknown" and prev not in (None, "unknown"):
+                    notify_admin(
+                        f"⚠️ {name}: check nahi ho saka.\n{note}"
+                    )
+
+                WATCH_STATE[name] = status
+            except Exception:
+                log.exception("Watcher error")
+        time.sleep(CHECK_EVERY)
+
+
+@bot.message_handler(commands=["checknow"])
+def check_now(message):
+    if not allowed(message):
+        return bot.reply_to(message, "⛔ Access nahi hai.")
+
+    lines = []
+    for name, url in WATCH_URLS.items():
+        status, note = check_page(url)
+        lines.append(f"{name}: {status} - {note}")
+
+    bot.reply_to(message, "🔎 Abhi ka nateeja:\n\n" + "\n".join(lines))
 
 
 # ---------------- BUTTONS ----------------
@@ -591,10 +700,10 @@ def fallback(message):
 
 init_storage()
 configure_webhook()
+threading.Thread(target=watcher_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000))
-    )
-    
+)
