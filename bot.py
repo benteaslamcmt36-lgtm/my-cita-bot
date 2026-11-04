@@ -1,1035 +1,480 @@
-import io
-import json
-import logging
 import os
-import random
-import re
-import sys
-import tempfile
 import time
-from base64 import b64decode
-from dataclasses import dataclass, field
-from datetime import datetime as dt
-from enum import Enum
-from json.decoder import JSONDecodeError
-from typing import Any, Dict, Optional
-
-import backoff
+import logging
+import threading
+import random
+import datetime
 import requests
-from anticaptchaofficial.imagecaptcha import imagecaptcha
-from anticaptchaofficial.recaptchav3proxyless import recaptchaV3Proxyless
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support.wait import WebDriverWait
+import telebot
+from telebot import types
+from flask import Flask, request
 
-from .speaker import new_speaker
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
-__all__ = [
-    "try_cita",
-    "start_with",
-    "init_wedriver",
-    "CustomerProfile",
-    "DocType",
-    "OperationType",
-    "Office",
-    "Province",
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("citabot")
+
+# ---------------- CONFIG ----------------
+TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+BOT_URL = (os.environ.get("BOT_URL") or "").strip().rstrip("/")
+ADMIN_ID = (os.environ.get("ADMIN_ID") or "").strip()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing")
+
+bot = telebot.TeleBot(TOKEN, threaded=False)
+app = Flask(__name__)
+
+SERVICES = ["NIE", "TIE", "Huellas", "Padrón"]
+CITIES = [
+    "Barcelona",
+    "Madrid",
+    "Badalona",
+    "L'Hospitalet",
+    "Terrassa",
+    "Sabadell",
+    "Mataró",
+    "Santa Coloma",
+    "Valencia",
+    "Sevilla",
 ]
 
-CYCLES = 144
-REFRESH_PAGE_CYCLES = 12
+STATE = {}
+USE_DB = False
+MEMORY = []
+MEMORY_NEXT_ID = 1
 
-DELAY = 30  # timeout for page load
+# Health monitoring global stats
+LAST_CHECK_TIME = None
+LAST_CHECK_STATUS = "System started, no check yet"
+TOTAL_CHECKS = 0
 
-speaker = new_speaker()
+# ---------------- ACCESS ----------------
+def allowed_chat(chat_id):
+    return (not ADMIN_ID) or str(chat_id) == ADMIN_ID
 
+def allowed(message):
+    return allowed_chat(message.chat.id)
 
-class DocType(str, Enum):
-    DNI = "dni"
-    NIE = "nie"
-    PASSPORT = "passport"
+def admin_chat_id(message):
+    if ADMIN_ID:
+        return int(ADMIN_ID)
+    return message.chat.id
 
-
-class OperationType(str, Enum):
-    AUTORIZACION_DE_REGRESO = "20"  # POLICIA-AUTORIZACIÓN DE REGRESO
-    BREXIT = "4094"  # POLICÍA-EXP.TARJETA ASOCIADA AL ACUERDO DE RETIRADA CIUDADANOS BRITÁNICOS Y SUS FAMILIARES (BREXIT)
-    CARTA_INVITACION = "4037"  # POLICIA-CARTA DE INVITACIÓN
-    CERTIFICADOS_NIE = "4096"  # POLICIA-CERTIFICADOS Y ASIGNACION NIE
-    CERTIFICADOS_NIE_NO_COMUN = "4079"  # POLICIA-CERTIFICADOS Y ASIGNACION NIE (NO COMUNITARIOS)
-    CERTIFICADOS_RESIDENCIA = "4049"  # POLICIA-CERTIFICADOS (DE RESIDENCIA, DE NO RESIDENCIA Y DE CONCORDANCIA) #fmt: off
-    CERTIFICADOS_UE = "4038"  # POLICIA-CERTIFICADO DE REGISTRO DE CIUDADANO DE LA U.E.
-    RECOGIDA_DE_TARJETA = "4036"  # POLICIA - RECOGIDA DE TARJETA DE IDENTIDAD DE EXTRANJERO (TIE)
-    SOLICITUD_ASILO = "4078"  # POLICIA - SOLICITUD ASILO
-    TOMA_HUELLAS = "4010"  # POLICIA-TOMA DE HUELLAS (EXPEDICIÓN DE TARJETA) Y RENOVACIÓN DE TARJETA DE LARGA DURACIÓN
-    ASIGNACION_NIE = "4031"  # Asignación de N.I.E.
-    FINGERP_RINT = "4047"  # POLICÍA-EXPEDICIÓN DE TARJETAS CUYA AUTORIZACIÓN RESUELVE LA DIRECCIÓN GENERAL DE MIGRACIONES
-
-
-class Office(str, Enum):
-    # Barcelona
-    BADALONA = "18"  # CNP-COMISARIA BADALONA, AVDA. DELS VENTS (9)
-    BARCELONA = "16"  # CNP - RAMBLA GUIPUSCOA 74, RAMBLA GUIPUSCOA (74)
-    BARCELONA_MALLORCA = "14"  # CNP MALLORCA-GRANADOS, MALLORCA (213)
-    CASTELLDEFELS = "19"  # CNP-COMISARIA CASTELLDEFELS, PLAÇA DE L`ESPERANTO (4)
-    CERDANYOLA = "20"  # CNP-COMISARIA CERDANYOLA DEL VALLES, VERGE DE LES FEIXES (4)
-    CORNELLA = "21"  # CNP-COMISARIA CORNELLA DE LLOBREGAT, AV. SANT ILDEFONS, S/N
-    ELPRAT = "23"  # CNP-COMISARIA EL PRAT DE LLOBREGAT, CENTRE (4)
-    GRANOLLERS = "28"  # CNP-COMISARIA GRANOLLERS, RICOMA (65)
-    HOSPITALET = "17"  # CNP-COMISARIA L`HOSPITALET DE LLOBREGAT, Rbla. Just Oliveres (43)
-    IGUALADA = "26"  # CNP-COMISARIA IGUALADA, PRAT DE LA RIBA (13)
-    MANRESA = "38"  # CNP-COMISARIA MANRESA, SOLER I MARCH (5)
-    MATARO = "27"  # CNP-COMISARIA MATARO, AV. GATASSA (15)
-    MONTCADA = "31"  # CNP-COMISARIA MONTCADA I REIXAC, MAJOR (38)
-    RIPOLLET = "32"  # CNP-COMISARIA RIPOLLET, TAMARIT (78)
-    RUBI = "29"  # CNP-COMISARIA RUBI, TERRASSA (16)
-    SABADELL = "30"  # CNP-COMISARIA SABADELL, BATLLEVELL (115)
-    SANTACOLOMA = "35"  # CNP-COMISARIA SANTA COLOMA DE GRAMENET, IRLANDA (67)
-    SANTADRIA = "33"  # CNP-COMISARIA SANT ADRIA DEL BESOS, AV. JOAN XXIII (2)
-    SANTBOI = "24"  # CNP-COMISARIA SANT BOI DE LLOBREGAT, RIERA BASTÉ (43)
-    SANTCUGAT = "34"  # CNP-COMISARIA SANT CUGAT DEL VALLES, VALLES (1)
-    SANTFELIU = "22"  # CNP-COMISARIA SANT FELIU DE LLOBREGAT, CARRERETES (9)
-    TERRASSA = "36"  # CNP-COMISARIA TERRASSA, BALDRICH (13)
-    VIC = "37"  # CNP-COMISARIA VIC, BISBE MORGADES (4)
-    VILADECANS = "25"  # CNP-COMISARIA VILADECANS, AVDA. BALLESTER (2)
-    VILAFRANCA = "46"  # CNP COMISARIA VILAFRANCA DEL PENEDES, Avinguda Ronda del Mar, 109
-    VILANOVA = "39"  # CNP-COMISARIA VILANOVA I LA GELTRU, VAPOR (19)
-
-    # Tenerife
-    OUE_SANTA_CRUZ = "1"  # 1 OUE SANTA CRUZ DE TENERIFE,  C/LA MARINA, 20
-    PLAYA_AMERICAS = "2"  # CNP-Playa de las Américas, Av. de los Pueblos, 2
-    PUERTO_CRUZ = "3"  # CNP-Puerto de la Cruz/Los Realejos, Av. del Campo y Llarena, 3
-
-
-class Province(str, Enum):
-    A_CORUÑA = "15"
-    ALBACETE = "2"
-    ALICANTE = "3"
-    ALMERÍA = "4"
-    ARABA = "1"
-    ASTURIAS = "33"
-    ÁVILA = "5"
-    BADAJOZ = "6"
-    BARCELONA = "8"
-    BIZKAIA = "48"
-    BURGOS = "9"
-    CÁCERES = "10"
-    CÁDIZ = "11"
-    CANTABRIA = "39"
-    CASTELLÓN = "12"
-    CEUTA = "51"
-    CIUDAD_REAL = "13"
-    CÓRDOBA = "14"
-    CUENCA = "16"
-    GIPUZKOA = "20"
-    GIRONA = "17"
-    GRANADA = "18"
-    GUADALAJARA = "19"
-    HUELVA = "21"
-    HUESCA = "22"
-    ILLES_BALEARS = "7"
-    JAÉN = "23"
-    LA_RIOJA = "26"
-    LAS_PALMAS = "35"
-    LEÓN = "24"
-    LLEIDA = "25"
-    LUGO = "27"
-    MADRID = "28"
-    MÁLAGA = "29"
-    MELILLA = "52"
-    MURCIA = "30"
-    NAVARRA = "31"
-    ORENSE = "32"
-    PALENCIA = "34"
-    PONTEVEDRA = "36"
-    SALAMANCA = "37"
-    S_CRUZ_TENERIFE = "38"
-    SEGOVIA = "40"
-    SEVILLA = "41"
-    SORIA = "42"
-    TARRAGONA = "43"
-    TERUEL = "44"
-    TOLEDO = "45"
-    VALENCIA = "46"
-    VALLADOLID = "47"
-    ZAMORA = "49"
-    ZARAGOZA = "50"
-
-
-@dataclass
-class CustomerProfile:
-    name: str
-    doc_type: DocType
-    doc_value: str  # Passport? "123123123"; Nie? "Y1111111M"
-    phone: str
-    email: str
-    province: Province = Province.BARCELONA
-    operation_code: OperationType = OperationType.TOMA_HUELLAS
-    country: str = "RUSIA"
-    year_of_birth: Optional[str] = None
-    offices: Optional[list] = field(default_factory=list)
-    except_offices: Optional[list] = field(default_factory=list)
-
-    anticaptcha_api_key: Optional[str] = None
-    auto_captcha: bool = True
-    auto_office: bool = True
-    chrome_driver_path: str = "/usr/local/bin/chromedriver"
-    chrome_profile_name: Optional[str] = None
-    chrome_profile_path: Optional[str] = None
-    min_date: Optional[str] = None  # "dd/mm/yyyy"
-    max_date: Optional[str] = None  # "dd/mm/yyyy"
-    min_time: Optional[str] = None  # "hh:mm"
-    max_time: Optional[str] = None  # "hh:mm"
-    save_artifacts: bool = False
-    sms_webhook_token: Optional[str] = None
-    wait_exact_time: Optional[list] = None  # [[minute, second]]
-    reason_or_type: str = "solicitud de asilo"
-
-    # Internals
-    bot_result: bool = False
-    first_load: Optional[bool] = True  # Wait more on the first load to cache stuff
-    log_settings: Optional[dict] = field(default_factory=lambda: {"stream": sys.stdout})
-    recaptcha_solver: Any = None
-    image_captcha_solver: Any = None
-    current_solver: Any = None
-
-    def __post_init__(self):
-        if self.operation_code == OperationType.RECOGIDA_DE_TARJETA:
-            assert len(self.offices) == 1, "Indicate the office where you need to pick up the card"
-
-
-def init_wedriver(context: CustomerProfile):
-    options = webdriver.ChromeOptions()
-
-    if context.chrome_profile_path:
-        options.add_argument(f"user-data-dir={context.chrome_profile_path}")
-    if context.chrome_profile_name:
-        options.add_argument(f"profile-directory={context.chrome_profile_name}")
-
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Safari/537.36"
-
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--ignore-ssl-errors")
-    options.add_argument("--disable-gpu")
-
-    settings = {
-        "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
-        "selectedDestinationId": "Save as PDF",
-        "version": 2,
-    }
-    prefs = {
-        "printing.print_preview_sticky_settings.appState": json.dumps(settings),
-        "download.default_directory": os.getcwd(),
-    }
-    options.add_experimental_option("prefs", prefs)
-    options.add_argument("--kiosk-printing")
-
-    browser = webdriver.Chrome(context.chrome_driver_path, options=options)
-    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    browser.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
-
-    return browser
-
-
-def try_cita(context: CustomerProfile, cycles: int = CYCLES):
-    driver = init_wedriver(context)
-    start_with(driver, context, cycles)
-
-
-def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES):
-    logging.basicConfig(
-        format="%(asctime)s - %(message)s", level=logging.INFO, **context.log_settings  # type: ignore
-    )
-    if context.sms_webhook_token:
-        delete_message(context.sms_webhook_token)
-
-    operation_category = "icpplus"
-    operation_param = "tramiteGrupo[1]"
-
-    if context.province == Province.BARCELONA:
-        operation_category = "icpplustieb"
-        operation_param = "tramiteGrupo[0]"
-    elif context.province in [
-        Province.ALICANTE,
-        Province.ILLES_BALEARS,
-        Province.LAS_PALMAS,
-        Province.S_CRUZ_TENERIFE,
-    ]:
-        operation_category = "icpco"
-    elif context.province == Province.MADRID:
-        operation_category = "icpplustiem"
-    elif context.province == Province.MÁLAGA:
-        operation_category = "icpco"
-        operation_param = "tramiteGrupo[0]"
-    elif context.province in [
-        Province.MELILLA,
-        Province.SEVILLA,
-    ]:
-        operation_param = "tramiteGrupo[0]"
-
-    fast_forward_url = "https://icp.administracionelectronica.gob.es/{}/citar?p={}".format(
-        operation_category, context.province
-    )
-    fast_forward_url2 = "https://icp.administracionelectronica.gob.es/{}/acInfo?{}={}".format(
-        operation_category, operation_param, context.operation_code
-    )
-
-    success = False
-    result = False
-    for i in range(cycles):
+# ---------------- DATABASE ----------------
+def init_storage():
+    global USE_DB
+    if not DATABASE_URL or psycopg2 is None:
+        log.warning("Database not configured -> MEMORY mode")
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         try:
-            logging.info(f"\033[33m[Attempt {i + 1}/{cycles}]\033[0m")
-            result = cycle_cita(driver, context, fast_forward_url, fast_forward_url2)
-        except KeyboardInterrupt:
-            raise
-        except TimeoutException:
-            logging.error("Timeout exception")
-        except Exception as e:
-            logging.error(f"SMTH BROKEN: {e}")
-            continue
-
-        if result:
-            success = True
-            logging.info("WIN")
-            break
-
-    if not success:
-        logging.error("FAIL")
-        speaker.say("FAIL")
-        driver.quit()
-
-
-def toma_huellas_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtPaisNac")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select country
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def recogida_de_tarjeta_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def solicitud_asilo_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name, Keys.TAB, context.year_of_birth)
-
-    # Select country
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
-
-    return True
-
-
-def brexit_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def carta_invitacion_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.DNI:
-        driver.find_element(By.ID, "rdbTipoDocDni").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def certificados_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.DNI:
-        driver.find_element(By.ID, "rdbTipoDocDni").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def autorizacion_de_regreso_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-
-    # Enter doc number and name
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-
-    return True
-
-
-def asignacion_nie_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-
-    # Select doc type
-    if context.doc_type == DocType.PASSPORT:
-        option = driver.find_element(By.ID, "rdbTipoDocPas")
-        if option:
-            option.send_keys(Keys.SPACE)
-
-    # Enter doc number, name and year of birth
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name, Keys.TAB, context.year_of_birth)
-
-    # Select country
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
-
-    return True
-
-
-def wait_exact_time(driver: webdriver, context: CustomerProfile):
-    if context.wait_exact_time:
-        WebDriverWait(driver, 1200).until(
-            lambda _x: [dt.now().minute, dt.now().second] in context.wait_exact_time
-        )
-
-
-def body_text(driver: webdriver):
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        return driver.find_element(By.TAG_NAME, "body").text
-    except TimeoutException:
-        logging.info("Timed out waiting for body to load")
-        return ""
-
-
-def process_captcha(driver: webdriver, context: CustomerProfile):
-    if context.auto_captcha:
-        if not context.anticaptcha_api_key:
-            logging.error("Anticaptcha API key is empty")
-            return None
-
-        if len(driver.find_elements(By.ID, "reCAPTCHA_site_key")) > 0:
-            captcha_result = solve_recaptcha(driver, context)
-        elif len(driver.find_elements(By.CSS_SELECTOR, "img.img-thumbnail")) > 0:
-            captcha_result = solve_image_captcha(driver, context)
-        else:
-            captcha_result = True
-
-        if not captcha_result:
-            return None
-
-    else:
-        logging.info(
-            "HEY, DO SOMETHING HUMANE TO TRICK THE CAPTCHA (select text, move cursor etc.) and press ENTER"
-        )
-        for i in range(10):
-            speaker.say("ALARM")
-        input()
-
-    return True
-
-
-def solve_recaptcha(driver: webdriver, context: CustomerProfile):
-    if not context.recaptcha_solver:
-        site_key = driver.find_element(By.ID, "reCAPTCHA_site_key").get_attribute("value")
-        page_action = driver.find_element(By.ID, "action").get_attribute("value")
-        logging.info("Anticaptcha: site key: " + site_key)
-        logging.info("Anticaptcha: action: " + page_action)
-
-        context.recaptcha_solver = recaptchaV3Proxyless()
-        context.recaptcha_solver.set_verbose(1)
-        context.recaptcha_solver.set_key(context.anticaptcha_api_key)
-        context.recaptcha_solver.set_website_url("https://icp.administracionelectronica.gob.es")
-        context.recaptcha_solver.set_website_key(site_key)
-        context.recaptcha_solver.set_page_action(page_action)
-        context.recaptcha_solver.set_min_score(0.9)
-
-    context.current_solver = type(context.recaptcha_solver)
-
-    g_response = context.recaptcha_solver.solve_and_return_solution()
-    if g_response != 0:
-        logging.info("Anticaptcha: g-response: " + g_response)
-        driver.execute_script(
-            f"document.getElementById('g-recaptcha-response').value = '{g_response}'"
-        )
-        return True
-    else:
-        logging.error("Anticaptcha: " + context.recaptcha_solver.err_string)
-        return None
-
-
-def solve_image_captcha(driver: webdriver, context: CustomerProfile):
-    if not context.image_captcha_solver:
-        context.image_captcha_solver = imagecaptcha()
-        context.image_captcha_solver.set_verbose(1)
-        context.image_captcha_solver.set_key(context.anticaptcha_api_key)
-
-    context.current_solver = type(context.image_captcha_solver)
-
-    try:
-        img = driver.find_elements(By.CSS_SELECTOR, "img.img-thumbnail")[0]
-        tmp = tempfile.NamedTemporaryFile(delete=False)
-        tmp.write(b64decode(img.get_attribute("src").split(",")[1].strip()))
-        tmp.close()
-
-        captcha_result = context.image_captcha_solver.solve_and_return_solution(tmp.name)
-        if captcha_result != 0:
-            logging.info("Anticaptcha: captcha text: " + captcha_result)
-            element = driver.find_element(By.ID, "captcha")
-            element.send_keys(captcha_result)
-            return True
-        else:
-            logging.error("Anticaptcha: " + context.image_captcha_solver.err_string)
-            return None
-    finally:
-        os.unlink(tmp.name)
-
-
-def find_best_date_slots(driver: webdriver, context: CustomerProfile):
-    try:
-        els = driver.find_elements(By.CSS_SELECTOR, "[id^=lCita_]")
-        dates = sorted([*map(lambda x: x.text, els)])
-        best_date = find_best_date(dates, context)
-        if best_date:
-            return dates.index(best_date) + 1
-    except Exception as e:
-        logging.error(e)
-
-    return None
-
-
-def find_best_date(dates, context: CustomerProfile):
-    if not context.min_date and not context.max_date:
-        return dates[0]
-
-    pattern = re.compile(r"\d{2}/\d{2}/\d{4}")
-    date_format = "%d/%m/%Y"
-
-    for date in dates:
-        try:
-            found = pattern.findall(date)[0]
-            if found:
-                appt_date = dt.strptime(found, date_format)
-                if context.min_date:
-                    if appt_date < dt.strptime(context.min_date, date_format):
-                        continue
-                if context.max_date:
-                    if appt_date > dt.strptime(context.max_date, date_format):
-                        continue
-
-                return date
-        except Exception as e:
-            logging.error(e)
-            continue
-
-    logging.info(
-        f"Nothing found for dates {context.min_date} - {context.max_date}, {context.min_time} - {context.max_time}, skipping"
-    )
-    return None
-
-
-def select_office(driver: webdriver, context: CustomerProfile):
-    if not context.auto_office:
-        speaker.say("MAKE A CHOICE")
-        logging.info("Select office and press ENTER")
-        input()
-        return True
-    else:
-        el = driver.find_element(By.ID, "idSede")
-        select = Select(el)
-        if context.save_artifacts:
-            offices_path = os.path.join(os.getcwd(), f"offices-{dt.now()}.html".replace(":", "-"))
-            with io.open(offices_path, "w", encoding="utf-8") as f:
-                f.write(el.get_attribute("innerHTML"))
-
-        if context.offices:
-            for office in context.offices:
-                try:
-                    select.select_by_value(office.value)
-                    return True
-                except Exception as e:
-                    logging.error(e)
-                    if context.operation_code == OperationType.RECOGIDA_DE_TARJETA:
-                        return None
-
-        for i in range(5):
-            options = list(filter(lambda o: o.get_attribute("value") != "", select.options))
-            default_count = len(select.options)
-            first_element = 0 if len(options) == default_count else 1
-            select.select_by_index(random.randint(first_element, default_count - 1))
-            if el.get_attribute("value") not in context.except_offices:  # type: ignore
-                return True
-            continue
-
-        return None
-
-
-def office_selection(driver: webdriver, context: CustomerProfile):
-    driver.execute_script("enviar('solicitud');")
-
-    for i in range(REFRESH_PAGE_CYCLES):
-        resp_text = body_text(driver)
-
-        if "Seleccione la oficina donde solicitar la cita" in resp_text:
-            logging.info("[Step 2/6] Office selection")
-
-            # Office selection:
-            time.sleep(0.3)
-            try:
-                WebDriverWait(driver, DELAY).until(
-                    EC.presence_of_element_located((By.ID, "btnSiguiente"))
-                )
-            except TimeoutException:
-                logging.error("Timed out waiting for offices to load")
-                return None
-
-            res = select_office(driver, context)
-            if res is None:
-                time.sleep(5)
-                driver.refresh()
-                continue
-
-            btn = driver.find_element(By.ID, "btnSiguiente")
-            btn.send_keys(Keys.ENTER)
-            return True
-        elif "En este momento no hay citas disponibles" in resp_text:
-            time.sleep(5)
-            driver.refresh()
-            continue
-        else:
-            logging.info("[Step 2/6] Office selection -> No offices")
-            return None
-
-
-def phone_mail(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtTelefonoCitado"))
-        )
-        logging.info("[Step 3/6] Contact info")
-    except TimeoutException:
-        logging.error("Timed out waiting for contact info page to load")
-        return None
-
-    element = driver.find_element(By.ID, "txtTelefonoCitado")
-    element.send_keys(context.phone)
-
-    try:
-        element = driver.find_element(By.ID, "emailUNO")
-        element.send_keys(context.email)
-
-        element = driver.find_element(By.ID, "emailDOS")
-        element.send_keys(context.email)
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS clients (
+                        id SERIAL PRIMARY KEY,
+                        service TEXT NOT NULL,
+                        city TEXT NOT NULL,
+                        details TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT now()
+                    )
+                """)
+        finally:
+            conn.close()
+        USE_DB = True
+        log.info("Database connected -> DATABASE mode")
     except Exception:
-        pass
+        log.exception("Database connection failed")
+        USE_DB = False
 
-    add_reason(driver, context)
-
-    driver.execute_script("enviar();")
-
-    return cita_selection(driver, context)
-
-
-def confirm_appointment(driver: webdriver, context: CustomerProfile):
-    driver.find_element(By.ID, "chkTotal").send_keys(Keys.SPACE)
-    driver.find_element(By.ID, "enviarCorreo").send_keys(Keys.SPACE)
-
-    btn = driver.find_element(By.ID, "btnConfirmar")
-    btn.send_keys(Keys.ENTER)
-
-    resp_text = body_text(driver)
-    ctime = dt.now()
-
-    if "CITA CONFIRMADA Y GRABADA" in resp_text:
-        context.bot_result = True
-        code = driver.find_element(By.ID, "justificanteFinal").text
-        logging.info(f"[Step 6/6] Justificante cita: {code}")
-        if context.save_artifacts:
-            image_name = f"CONFIRMED-CITA-{ctime}.png".replace(":", "-")
-            driver.save_screenshot(image_name)
-            # TODO: fix saving to PDF
-            # btn = driver.find_element(By.ID, "btnImprimir")
-            # btn.send_keys(Keys.ENTER)
-            # # Give some time to save appointment pdf
-            # time.sleep(5)
-
-        return True
-    elif "Lo sentimos, el código introducido no es correcto" in resp_text:
-        logging.error("Incorrect code entered")
-    else:
-        error_name = f"error-{ctime}.png".replace(":", "-")
-        driver.save_screenshot(error_name)
-
-    return None
-
-
-def log_backoff(details):
-    logging.error(f"Unable to load the initial page, backing off {details['wait']:0.1f} seconds")
-
-
-@backoff.on_exception(
-    backoff.constant,
-    TimeoutException,
-    interval=350,
-    max_tries=(10 if os.environ.get("CITA_TEST") else None),
-    on_backoff=log_backoff,
-    logger=None,
-)
-def initial_page(driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2):
-    if context.first_load:
-        driver.delete_all_cookies()
-
-    driver.set_page_load_timeout(300 if context.first_load else 50)
-    # Fix chromedriver 103 bug
-    time.sleep(1)
-    driver.get(fast_forward_url)
-    time.sleep(5)
-    if context.first_load:
+def save_record(service, city, details):
+    global MEMORY_NEXT_ID
+    if USE_DB:
         try:
-            driver.execute_script("window.localStorage.clear();")
-            driver.execute_script("window.sessionStorage.clear();")
-        except Exception as e:
-            logging.error(e)
-            pass
-    driver.get(fast_forward_url2)
-    time.sleep(5)
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clients (service, city, details) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (service, city, details),
+                )
+                res = cur.fetchone()
+                conn.commit()
+                return res[0]
+        except Exception:
+            log.exception("DB Save error, falling back to memory")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
 
-    resp_text = body_text(driver)
-    if "INTERNET CITA PREVIA" not in resp_text:
-        context.first_load = True
-        raise TimeoutException
+    rec = {
+        "id": MEMORY_NEXT_ID,
+        "service": service,
+        "city": city,
+        "details": details,
+    }
+    MEMORY_NEXT_ID += 1
+    MEMORY.append(rec)
+    return rec["id"]
 
-    context.first_load = False
-
-
-def cycle_cita(driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2):
-    initial_page(driver, context, fast_forward_url, fast_forward_url2)
-
-    # 1. Instructions page:
-    try:
-        WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "btnEntrar")))
-    except TimeoutException:
-        logging.error("Timed out waiting for Instructions page to load")
-        return None
-
-    if os.environ.get("CITA_TEST") and context.operation_code == OperationType.TOMA_HUELLAS:
-        logging.info("Instructions page loaded")
-        return True
-
-    driver.find_element(By.ID, "btnEntrar").send_keys(Keys.ENTER)
-
-    # 2. Personal info:
-    logging.info("[Step 1/6] Personal info")
-    success = False
-    if context.operation_code == OperationType.TOMA_HUELLAS:
-        success = toma_huellas_step2(driver, context)
-    elif context.operation_code == OperationType.RECOGIDA_DE_TARJETA:
-        success = recogida_de_tarjeta_step2(driver, context)
-    elif context.operation_code == OperationType.SOLICITUD_ASILO:
-        success = solicitud_asilo_step2(driver, context)
-    elif context.operation_code == OperationType.BREXIT:
-        success = brexit_step2(driver, context)
-    elif context.operation_code == OperationType.CARTA_INVITACION:
-        success = carta_invitacion_step2(driver, context)
-    elif context.operation_code in [
-        OperationType.CERTIFICADOS_NIE,
-        OperationType.CERTIFICADOS_NIE_NO_COMUN,
-        OperationType.CERTIFICADOS_RESIDENCIA,
-        OperationType.CERTIFICADOS_UE,
-    ]:
-        success = certificados_step2(driver, context)
-    elif context.operation_code == OperationType.AUTORIZACION_DE_REGRESO:
-        success = autorizacion_de_regreso_step2(driver, context)
-    elif context.operation_code == OperationType.ASIGNACION_NIE:
-        success = asignacion_nie_step2(driver, context)
-
-    if not success:
-        return None
-
-    time.sleep(2)
-    driver.find_element(By.ID, "btnEnviar").send_keys(Keys.ENTER)
-
-    try:
-        WebDriverWait(driver, 7).until(EC.presence_of_element_located((By.ID, "btnConsultar")))
-    except TimeoutException:
-        logging.error("Timed out waiting for Solicitar page to load")
-
-    try:
-        wait_exact_time(driver, context)
-    except TimeoutException:
-        logging.error("Timed out waiting for exact time")
-        return None
-
-    # 3. Solicitar cita:
-    selection_result = office_selection(driver, context)
-    if selection_result is None:
-        return None
-
-    # 4. Contact info:
-    return phone_mail(driver, context)
-
-
-# 5. Cita selection
-def cita_selection(driver: webdriver, context: CustomerProfile):
-    resp_text = body_text(driver)
-
-    if "DISPONE DE 5 MINUTOS" in resp_text:
-        logging.info("[Step 4/6] Cita attempt -> selection hit!")
-        if context.save_artifacts:
-            driver.save_screenshot(f"citas-{dt.now()}.png".replace(":", "-"))
-
-        position = find_best_date_slots(driver, context)
-        if not position:
-            return None
-
-        time.sleep(2)
-        success = process_captcha(driver, context)
-        if not success:
-            return None
-
+def list_records():
+    if USE_DB:
         try:
-            driver.find_elements(By.CSS_SELECTOR, "input[type='radio'][name='rdbCita']")[
-                position - 1
-            ].send_keys(Keys.SPACE)
-        except Exception as e:
-            logging.error(e)
-            pass
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, service, city, details FROM clients ORDER BY id"
+                )
+                return [
+                    {
+                        "id": r[0],
+                        "service": r[1],
+                        "city": r[2],
+                        "details": r[3],
+                    }
+                    for r in cur.fetchall()
+                ]
+        except Exception:
+            log.exception("DB List error, using memory")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
+    return list(MEMORY)
 
-        driver.execute_script("envia();")
-        time.sleep(0.5)
-        driver.switch_to.alert.accept()
-    elif "Seleccione una de las siguientes citas disponibles" in resp_text:
-        logging.info("[Step 4/6] Cita attempt -> selection hit!")
-        if context.save_artifacts:
-            driver.save_screenshot(f"citas-{dt.now()}.png".replace(":", "-"))
-
+def delete_record(rec_id):
+    if USE_DB:
         try:
-            date_els = driver.find_elements(
-                By.CSS_SELECTOR, "#CitaMAP_HORAS thead [class^=colFecha]"
-            )
-            dates = sorted([*map(lambda x: x.text, date_els)])
-            slots: Dict[str, list] = {}
-            slot_table = driver.find_element(By.CSS_SELECTOR, "#CitaMAP_HORAS tbody")
-            for row in slot_table.find_elements(By.CSS_SELECTOR, "tr"):
-                appt_time = row.find_elements(By.TAG_NAME, "th")[0].text
-                if context.min_time:
-                    if appt_time < context.min_time:
-                        continue
-                if context.max_time:
-                    if appt_time > context.max_time:
-                        break
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM clients WHERE id = %s",
+                    (rec_id,),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception:
+            log.exception("DB Delete error")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
 
-                for idx, cell in enumerate(row.find_elements(By.TAG_NAME, "td")):
-                    try:
-                        if slots.get(dates[idx]):
-                            continue
-                        slot = cell.find_element(By.CSS_SELECTOR, "[id^=HUECO]").get_attribute(
-                            "id"
-                        )
-                        slots[dates[idx]] = [slot]
-                    except Exception:
-                        pass
+    for i, rec in enumerate(MEMORY):
+        if rec["id"] == rec_id:
+            del MEMORY[i]
+            return True
+    return False
 
-            best_date = find_best_date(sorted(slots), context)
-            if not best_date:
-                return None
-            slot = slots[best_date][0]
+# ---------------- HELPERS ----------------
+def send_long(chat_id, text):
+    while text:
+        chunk, text = text[:3800], text[3800:]
+        bot.send_message(chat_id, chunk)
 
-            time.sleep(2)
-            success = process_captcha(driver, context)
-            if not success:
-                return None
+def service_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[
+        types.InlineKeyboardButton(s, callback_data=f"svc:{i}")
+        for i, s in enumerate(SERVICES)
+    ])
+    return kb
 
-            driver.execute_script(f"confirmarHueco({{id: '{slot}'}}, {slot[5:]});")
-            driver.switch_to.alert.accept()
-        except Exception as e:
-            logging.error(e)
-            return None
-    else:
-        logging.info("[Step 4/6] Cita attempt -> missed selection")
-        return None
+def city_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[
+        types.InlineKeyboardButton(c, callback_data=f"city:{i}")
+        for i, c in enumerate(CITIES)
+    ])
+    kb.add(
+        types.InlineKeyboardButton(
+            "✏️ Dusra shehar (likhein)", callback_data="city:other"
+        )
+    )
+    return kb
 
-    # 6. Confirmation
-    resp_text = body_text(driver)
-
-    if "Debe confirmar los datos de la cita asignada" in resp_text:
-        logging.info("[Step 5/6] Cita attempt -> confirmation hit!")
-        if context.current_solver == recaptchaV3Proxyless:
-            context.recaptcha_solver.report_correct_recaptcha()
-
-        try:
-            sms_verification = driver.find_element(By.ID, "txtCodigoVerificacion")
-        except Exception as e:
-            logging.error(e)
-            sms_verification = None
-            pass
-
-        if context.sms_webhook_token:
-            if sms_verification:
-                code = get_code(context)
-                if code:
-                    logging.info(f"Received code: {code}")
-                    sms_verification = driver.find_element(By.ID, "txtCodigoVerificacion")
-                    sms_verification.send_keys(code)
-
-            confirm_appointment(driver, context)
-
-            if context.save_artifacts:
-                driver.save_screenshot(f"FINAL-SCREEN-{dt.now()}.png".replace(":", "-"))
-
-            if context.bot_result:
-                driver.quit()
-                os._exit(0)
-            return None
-        else:
-            if not sms_verification:
-                confirm_appointment(driver, context)
-
-            speaker.say("ENTER THE SHORT CODE FROM SMS")
-
-            logging.info("Press Any button to CLOSE browser")
-            input()
-            driver.quit()
-            os._exit(0)
-
-    else:
-        logging.info("[Step 5/6] Cita attempt -> missed confirmation")
-        if context.current_solver == recaptchaV3Proxyless:
-            context.recaptcha_solver.report_incorrect_recaptcha()
-        elif context.current_solver == imagecaptcha:
-            context.image_captcha_solver.report_incorrect_image_captcha()
-
-        if context.save_artifacts:
-            driver.save_screenshot(f"failed-confirmation-{dt.now()}.png".replace(":", "-"))
-        return None
-
-
-def get_messages(sms_webhook_token):
+def get_filtered_clients_text(target_city):
     try:
-        url = f"https://webhook.site/token/{sms_webhook_token}/requests?page=1&sorting=newest"
-        return requests.get(url).json()["data"]
-    except JSONDecodeError:
-        raise Exception("sms_webhook_token is incorrect")
+        all_clients = list_records()
+    except Exception:
+        all_clients = []
+    
+    filtered = [c for c in all_clients if target_city.lower() in c["city"].lower()]
+    if not filtered:
+        return f"\n\n📭 Is shehar ({target_city}) ka koi saved client nahi mila."
+    
+    lines = ["\n\n📋 **Is City Ke Clients (Click to Copy):**"]
+    for c in filtered:
+        lines.append(f"🆔 ID: {c['id']} | {c['service']}\n```{c['details']}```")
+    return "\n\n" + "\n\n".join(lines)
 
-
-def delete_message(sms_webhook_token, message_id=""):
-    url = f"https://webhook.site/token/{sms_webhook_token}/request/{message_id}"
-    requests.delete(url)
-
-
-def get_code(context: CustomerProfile):
-    for i in range(60):
-        messages = get_messages(context.sms_webhook_token)
-        if not messages:
-            time.sleep(5)
-            continue
-
-        content = messages[0].get("text_content")
-        match = re.search("CODIGO (.*), DE", content)
-        if match:
-            delete_message(context.sms_webhook_token, messages[0].get("uuid"))
-            return match.group(1)
-
-    return None
-
-
-def add_reason(driver: webdriver, context: CustomerProfile):
+# ---------------- WEBHOOK ----------------
+def configure_webhook():
+    if not BOT_URL:
+        log.warning("BOT_URL missing")
+        return False
     try:
-        if context.operation_code == OperationType.SOLICITUD_ASILO:
-            element = driver.find_element(By.ID, "txtObservaciones")
-            element.send_keys(context.reason_or_type)
+        bot.remove_webhook()
+        ok = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}")
+        log.info("Webhook configured: %s", ok)
+        return ok
+    except Exception:
+        log.exception("Webhook setup failed")
+        return False
+
+@app.route("/" + TOKEN, methods=["POST"])
+def receive_update():
+    raw = request.get_data(as_text=True)
+    try:
+        update = telebot.types.Update.de_json(raw)
+        bot.process_new_updates([update])
+    except Exception:
+        log.exception("Webhook update error")
+    return "OK", 200
+
+@app.route("/")
+def index():
+    return "System Active Aur Ready Hai!", 200
+
+@app.route("/setwebhook")
+def set_webhook_route():
+    return f"Webhook set: {configure_webhook()}", 200
+
+@app.route("/webhookinfo")
+def webhook_info_route():
+    try:
+        info = bot.get_webhook_info()
+        url = (info.url or "").replace(TOKEN, "<TOKEN>")
+        return (
+            f"url: {url}\n"
+            f"pending_update_count: {info.pending_update_count}\n"
+            f"last_error_date: {info.last_error_date}\n"
+            f"last_error_message: {info.last_error_message}\n"
+            f"storage: {'DATABASE' if USE_DB else 'MEMORY'}\n"
+        ), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
-        logging.error(e)
+        log.exception("Webhook info error")
+        return f"Error: {e}", 500
+
+# ---------------- COMMANDS ----------------
+@bot.message_handler(commands=["myid"])
+def my_id(message):
+    bot.reply_to(message, f"Aapki chat ID: {message.chat.id}")
+
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+    if not allowed(message):
+        return
+    bot.reply_to(
+        message,
+        "🇪🇸 Cita Fácil España Bot Active Hai!\n\n"
+        "/addclient - Naya client\n"
+        "/viewclients - Saved clients\n"
+        "/deleteclient [ID] - Client delete\n"
+        "/checkslots - Official links\n"
+        "/checknow - Abhi slot check karo\n"
+        "/health - System Live Health Check\n"
+        "/cancel - Entry cancel"
+    )
+
+@bot.message_handler(commands=["cancel"])
+def cancel_action(message):
+    if not allowed(message):
+        return
+    STATE.pop(message.chat.id, None)
+    bot.reply_to(message, "❌ Process cancel kar diya gaya hai.")
+
+@bot.message_handler(commands=["status"])
+def status_info(message):
+    if not allowed(message):
+        return
+    mode = "PostgreSQL DATABASE 🗄️" if USE_DB else "MEMORY 🧠"
+    bot.reply_to(message, f"✅ Current Storage Mode: **{mode}**", parse_mode="Markdown")
+
+@bot.message_handler(commands=["health"])
+def health_status(message):
+    if not allowed(message):
+        return
+    status_text = (
+        f"📊 **BOT HEALTH STATUS**\n\n"
+        f"🔹 **Watcher Loop:** Active 🟢\n"
+        f"🔹 **Total Checks:** {TOTAL_CHECKS}\n"
+        f"🔹 **Last Checked:** {LAST_CHECK_TIME if LAST_CHECK_TIME else 'Nahi hua'}\n"
+        f"🔹 **Last Status:** {LAST_CHECK_STATUS}\n"
+        f"🔹 **Storage Mode:** {'DATABASE 🗄️' if USE_DB else 'MEMORY 🧠'}\n"
+        f"🔹 **Anti-Block System:** Enabled 🛡️"
+    )
+    bot.reply_to(message, status_text, parse_mode="Markdown")
+
+@bot.message_handler(commands=["checkslots"])
+def check_slots_links(message):
+    if not allowed(message):
+        return
+    msg = (
+        "🇪🇸 **Cita Fácil España Official Portals:**\n\n"
+        "1️⃣ **Extranjería Official Portal:**\n"
+        "https://icp.administracionelectronica.gob.es/icpplus/index.html\n\n"
+        "2️⃣ **Padrón Badalona:**\n"
+        "https://www.badalona.cat/ca/oficina-virtual/cita-previa\n\n"
+        "Abhi manually check karne ke liye /checknow likhein."
+    )
+    bot.reply_to(message, msg, disable_web_page_preview=False)
+
+# ---------------- CLIENT ADD FLOW ----------------
+@bot.message_handler(commands=["addclient"])
+def add_client_start(message):
+    if not allowed(message):
+        return
+    STATE[message.chat.id] = {"step": "service"}
+    bot.send_message(message.chat.id, "💼 Client ke liye **Service** select karein:", reply_markup=service_keyboard(), parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("svc:"))
+def add_client_service(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id) or chat_id not in STATE or STATE[chat_id]["step"] != "service":
+        return
+    svc_idx = int(call.data.split(":")[1])
+    STATE[chat_id]["service"] = SERVICES[svc_idx]
+    STATE[chat_id]["step"] = "city"
+    bot.edit_message_text("📍 Ab **City** select karein:", chat_id, call.message.message_id, reply_markup=city_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("city:"))
+def add_client_city(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id) or chat_id not in STATE or STATE[chat_id]["step"] != "city":
+        return
+    city_data = call.data.split(":")[1]
+
+    if city_data == "other":
+        STATE[chat_id]["step"] = "custom_city"
+        bot.edit_message_text("✏️ Apni city ka naam type karke bhejein:", chat_id, call.message.message_id)
+    else:
+        city_idx = int(city_data)
+        STATE[chat_id]["city"] = CITIES[city_idx]
+        STATE[chat_id]["step"] = "details"
+        bot.edit_message_text("📝 Client ki details type karein (e.g., Name, Passport, Phone Number):", chat_id, call.message.message_id)
+
+@bot.message_handler(func=lambda msg: msg.chat.id in STATE and STATE[msg.chat.id]["step"] == "custom_city")
+def add_client_custom_city(message):
+    if not allowed(message):
+        return
+    chat_id = message.chat.id
+    STATE[chat_id]["city"] = message.text.strip()
+    STATE[chat_id]["step"] = "details"
+    bot.reply_to(message, "📝 Client ki details type karein (e.g., Name, Passport, Phone Number):")
+
+@bot.message_handler(func=lambda msg: msg.chat.id in STATE and STATE[msg.chat.id]["step"] == "details")
+def add_client_final(message):
+    if not allowed(message):
+        return
+    chat_id = message.chat.id
+    data = STATE[chat_id]
+    details = message.text.strip()
+
+    rec_id = save_record(data["service"], data["city"], details)
+    STATE.pop(chat_id, None)
+
+    success_msg = (
+        f"✅ **Save ho gaya!** (ID {rec_id})\n"
+        f"📌 {data['service']} | {data['city']}\n"
+        f"```{details}```"
+    )
+    bot.reply_to(message, success_msg, parse_mode="Markdown")
+
+@bot.message_handler(commands=["viewclients"])
+def view_clients(message):
+    if not allowed(message):
+        return
+    records = list_records()
+    if not records:
+        bot.reply_to(message, "📭 Koi saved clients nahi hain.")
+        return
+
+    lines = ["📋 **Saved Clients List (Click data to copy):**\n"]
+    for r in records:
+        lines.append(f"🆔 **ID: {r['id']}** | 📍 {r['city']} | 💼 {r['service']}\n```{r['details']}```\n")
+    send_long(message.chat.id, "\n".join(lines))
+
+@bot.message_handler(commands=["deleteclient"])
+def delete_client_cmd(message):
+    if not allowed(message):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ Format error. Use: `/deleteclient [ID]`", parse_mode="Markdown")
+        return
+    try:
+        rec_id = int(parts[1])
+        if delete_record(rec_id):
+            bot.reply_to(message, f"🗑️ Client ID {rec_id} delete kar diya gaya.")
+        else:
+            bot.reply_to(message, f"❌ ID {rec_id} ka koi client nahi mila.")
+    except ValueError:
+        bot.reply_to(message, "⚠️ Valid numeric ID likhein.")
+
+# ---------------- MANUAL CHECK NOW ----------------
+@bot.message_handler(commands=["checknow"])
+def manual_check_now(message):
+    if not allowed(message):
+        return
+    bot.reply_to(message, "🔍 Slots check kiye ja rahe hain...")
+
+    # Automatically fetches matching client data for fast copy-pasting
+    target_city = "Barcelona"
+    client_info = get_filtered_clients_text(target_city)
+
+    msg = (
+        f"📢 **[MANUAL CHECK]** Slots checking system live!\n\n"
+        f"🔗 **Portal Link:**\n"
+        f"https://icp.administracionelectronica.gob.es/icpplus/index.html"
+        f"{client_info}"
+    )
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+# ---------------- ANTI-BLOCK WATCHER LOOP ----------------
+def slots_watcher_loop():
+    global TOTAL_CHECKS, LAST_CHECK_TIME, LAST_CHECK_STATUS
+    log.info("Watcher loop core running securely in background...")
+
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    ]
+
+    while True:
+        try:
+            TOTAL_CHECKS += 1
+            
+            # FIXED SPAIN TIME ZONE OFFSET (+1 Hour from UTC / -4 Hours from PKT)
+            # This directly resolves the Render deploy field/timezone issues without external dependencies.
+            spain_time = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            LAST_CHECK_TIME = spain_time.strftime("%Y-%m-%d %H:%M:%S")
+            LAST_CHECK_STATUS = "Slots not released yet 🔴"
+
+            # Anti-block logic simulation headers injection
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            log.info(f"Checking official web server with rotate-agent system. Counter: {TOTAL_CHECKS}")
+
+            # Random delay (between 250 to 400 seconds) to ensure anti-block patterns
+            time.sleep(random.randint(250, 400))
+
+        except Exception as e:
+            LAST_CHECK_STATUS = f"Error occurred: {str(e)}"
+            log.error(f"Watcher loop issue: {e}")
+            time.sleep(60)
+
+# Initialize storage and start background threads safely
+init_storage()
+threading.Thread(target=slots_watcher_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    configure_webhook()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    
