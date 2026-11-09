@@ -505,6 +505,21 @@ def delete_client_cmd(message):
     else:
         bot.reply_to(message, f"Client ID {rec_id} was not found.")
 
+@app.route("/browser-test")
+def browser_test():
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto("https://example.com")
+            title = page.title()
+            browser.close()
+            return f"Chromium OK: {title}", 200
+    except Exception as e:
+        return f"Chromium ERROR: {str(e)}", 500
+
 # ---------------- STARTUP ----------------
 init_storage()
 
@@ -513,5 +528,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        )
-    
+            )
