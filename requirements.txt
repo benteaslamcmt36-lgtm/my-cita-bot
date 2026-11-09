@@ -1,5 +1,4 @@
-pyTelegramBotAPI
-Flask
-gunicorn
-requests
-psycopg2-binary
+pyTelegramBotAPI==4.29.1
+Flask==3.1.2
+gunicorn==23.0.0
+psycopg2-binary==2.9.10
