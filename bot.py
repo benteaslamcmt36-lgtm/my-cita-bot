@@ -1,330 +1,517 @@
 import os
+import time
 import logging
 import threading
-from datetime import datetime, timezone
-
+import datetime
 import telebot
-from flask import Flask, request, abort
+from telebot import types
+from flask import Flask, request
 
 try:
     import psycopg2
-    from psycopg2.extras import RealDictCursor
 except ImportError:
     psycopg2 = None
-    RealDictCursor = None
 
-# Render Environment Variables:
-# BOT_TOKEN, BOT_URL, ADMIN_ID, DATABASE_URL
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BOT_URL = os.getenv("BOT_URL", "").strip().rstrip("/")
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Add it in Render > Environment.")
-
-ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
-
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("cita-bot")
+log = logging.getLogger("citabot")
+
+# ---------------- CONFIG ----------------
+TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+BOT_URL = (os.environ.get("BOT_URL") or "").strip().rstrip("/")
+ADMIN_ID = (os.environ.get("ADMIN_ID") or "").strip()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing")
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
-# Temporary conversation state. Client records themselves are stored in PostgreSQL
-# when DATABASE_URL is configured.
-waiting_for_client = set()
-memory_clients = []
-memory_lock = threading.Lock()
+SERVICES = ["NIE", "TIE", "Huellas", "Padrón"]
+CITIES = [
+    "Barcelona", "Madrid", "Badalona", "L'Hospitalet",
+    "Terrassa", "Sabadell", "Mataró", "Santa Coloma",
+    "Valencia", "Sevilla",
+]
 
-SERVICE_LINKS = {
-    "NIE": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
-    "TIE": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
-    "Huellas": "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus",
-    "Padrón": "https://www.badalona.cat/"
-}
+STATE = {}
+USE_DB = False
+MEMORY = []
+MEMORY_NEXT_ID = 1
 
-def is_admin(message):
-    return ADMIN_ID is not None and message.chat.id == ADMIN_ID
+LAST_CHECK_TIME = None
+LAST_CHECK_STATUS = (
+    "REAL SLOT CHECKER NOT CONFIGURED. No official availability has been checked."
+)
+TOTAL_CHECKS = 0
+TODAYS_CHECKS = 0
+LAST_RESET_DATE = datetime.date.today()
 
-def ensure_database():
-    if not DATABASE_URL:
-        log.warning("DATABASE_URL is not set; client records will be temporary.")
+# ---------------- ACCESS ----------------
+def allowed_chat(chat_id):
+    return (not ADMIN_ID) or str(chat_id) == ADMIN_ID
+
+def allowed(message):
+    return allowed_chat(message.chat.id)
+
+# ---------------- DATABASE ----------------
+def init_storage():
+    global USE_DB
+    if not DATABASE_URL or psycopg2 is None:
+        log.warning("Database not configured; using temporary memory storage.")
         return
-    if psycopg2 is None:
-        raise RuntimeError("psycopg2 is missing. Install psycopg2-binary.")
-    with psycopg2.connect(DATABASE_URL, sslmode="require") as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS cita_clients (
-                    id SERIAL PRIMARY KEY,
-                    telegram_user_id BIGINT NOT NULL,
-                    client_name TEXT NOT NULL,
-                    service TEXT NOT NULL,
-                    city TEXT NOT NULL,
-                    phone TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-        conn.commit()
-
-def db_add_client(user_id, name, service, city, phone):
-    if DATABASE_URL:
-        with psycopg2.connect(DATABASE_URL, sslmode="require") as conn:
-            with conn.cursor() as cur:
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        try:
+            with conn, conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO cita_clients
-                    (telegram_user_id, client_name, service, city, phone)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (user_id, name, service, city, phone))
-                new_id = cur.fetchone()[0]
-            conn.commit()
-        return new_id
-    with memory_lock:
-        new_id = len(memory_clients) + 1
-        memory_clients.append({
-            "id": new_id, "telegram_user_id": user_id,
-            "client_name": name, "service": service,
-            "city": city, "phone": phone
-        })
-        return new_id
-
-def db_list_clients():
-    if DATABASE_URL:
-        with psycopg2.connect(DATABASE_URL, sslmode="require") as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT id, telegram_user_id, client_name, service, city, phone,
-                           created_at
-                    FROM cita_clients ORDER BY id DESC LIMIT 100
+                    CREATE TABLE IF NOT EXISTS clients (
+                        id SERIAL PRIMARY KEY,
+                        service TEXT NOT NULL,
+                        city TEXT NOT NULL,
+                        details TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT now()
+                    )
                 """)
-                return cur.fetchall()
-    with memory_lock:
-        return list(reversed(memory_clients[-100:]))
+        finally:
+            conn.close()
+        USE_DB = True
+        log.info("PostgreSQL database connected.")
+    except Exception:
+        log.exception("Database connection failed; using memory storage.")
+        USE_DB = False
 
-def db_delete_client(client_id):
-    if DATABASE_URL:
-        with psycopg2.connect(DATABASE_URL, sslmode="require") as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM cita_clients WHERE id = %s", (client_id,))
-                deleted = cur.rowcount
-            conn.commit()
-        return deleted > 0
-    with memory_lock:
-        for item in memory_clients:
-            if item["id"] == client_id:
-                memory_clients.remove(item)
-                return True
+def save_record(service, city, details):
+    global MEMORY_NEXT_ID
+    if USE_DB:
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO clients (service, city, details) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (service, city, details),
+                )
+                rec_id = cur.fetchone()[0]
+                conn.commit()
+                return rec_id
+        except Exception:
+            log.exception("Database save failed; falling back to memory.")
+        finally:
+            if conn:
+                conn.close()
+
+    rec = {
+        "id": MEMORY_NEXT_ID,
+        "service": service,
+        "city": city,
+        "details": details,
+    }
+    MEMORY_NEXT_ID += 1
+    MEMORY.append(rec)
+    return rec["id"]
+
+def list_records():
+    if USE_DB:
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, service, city, details FROM clients ORDER BY id"
+                )
+                return [
+                    {"id": r[0], "service": r[1], "city": r[2], "details": r[3]}
+                    for r in cur.fetchall()
+                ]
+        except Exception:
+            log.exception("Database list failed; using memory storage.")
+        finally:
+            if conn:
+                conn.close()
+    return list(MEMORY)
+
+def delete_record(rec_id):
+    if USE_DB:
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            with conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM clients WHERE id = %s", (rec_id,))
+                deleted = cur.rowcount > 0
+                conn.commit()
+                return deleted
+        except Exception:
+            log.exception("Database delete failed.")
+        finally:
+            if conn:
+                conn.close()
+
+    for index, rec in enumerate(MEMORY):
+        if rec["id"] == rec_id:
+            del MEMORY[index]
+            return True
     return False
 
-def clients_count():
-    return len(db_list_clients())
+# ---------------- KEYBOARDS / HELPERS ----------------
+def send_long(chat_id, text):
+    while text:
+        chunk, text = text[:3800], text[3800:]
+        bot.send_message(chat_id, chunk)
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.reply_to(
-        message,
-        "السلام علیکم! 🇪🇸\n"
-        "Cita Previa مددگار بوٹ تیار ہے۔\n\n"
-        "کمانڈز:\n"
-        "/help - تمام کمانڈز\n"
-        "/myid - اپنی Telegram ID\n"
-        "/addclient - کلائنٹ شامل کریں\n"
-        "/viewclients - محفوظ کلائنٹس (صرف ایڈمن)\n"
-        "/deleteclient ID - کلائنٹ حذف کریں (صرف ایڈمن)\n"
-        "/checkslots - سرکاری اپائنٹمنٹ لنکس\n"
-        "/status - بوٹ کی حالت"
-    )
+def service_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[
+        types.InlineKeyboardButton(s, callback_data=f"svc:{i}")
+        for i, s in enumerate(SERVICES)
+    ])
+    return kb
 
+def city_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(*[
+        types.InlineKeyboardButton(c, callback_data=f"city:{i}")
+        for i, c in enumerate(CITIES)
+    ])
+    kb.add(types.InlineKeyboardButton(
+        "Other city (type it)", callback_data="city:other"
+    ))
+    return kb
+
+def get_filtered_clients_text(target_city):
+    try:
+        records = list_records()
+    except Exception:
+        records = []
+    filtered = [
+        c for c in records
+        if target_city.lower() in c["city"].lower()
+    ]
+    if not filtered:
+        return f"\n\nNo saved clients found for {target_city}."
+    lines = [f"\n\nClients saved for {target_city}:"]
+    for c in filtered:
+        lines.append(
+            f"ID: {c['id']} | {c['service']}\n"
+            f"Details: {c['details']}"
+        )
+    return "\n\n".join(lines)
+
+# ---------------- SLOT ALERT MESSAGE ----------------
+# This sends an alert when another verified checker supplies a real count.
+# It does NOT fetch availability from the government portal itself.
+def send_slot_alert(city, office, count):
+    if not ADMIN_ID:
+        log.error("ADMIN_ID is missing; cannot send slot alert.")
+        return False
+    try:
+        count = int(count)
+        if count < 1:
+            return False
+        bot.send_message(
+            int(ADMIN_ID),
+            "🚨 HUELLAS SLOT ALERT\n\n"
+            f"📍 City: {city}\n"
+            f"🏢 Office: {office}\n"
+            f"🎟 Available slots: {count}\n\n"
+            "Open the official portal and complete the booking yourself:\n"
+            "https://citaprevia.administracionelectronica.gob.es/icpplus/index.html",
+        )
+        return True
+    except Exception:
+        log.exception("Slot alert could not be sent.")
+        return False
+
+# ---------------- WEBHOOK ----------------
+def configure_webhook():
+    if not BOT_URL:
+        log.warning("BOT_URL is missing.")
+        return False
+    try:
+        bot.remove_webhook()
+        result = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}")
+        log.info("Webhook configured: %s", result)
+        return result
+    except Exception:
+        log.exception("Webhook setup failed.")
+        return False
+
+@app.route("/" + TOKEN, methods=["POST"])
+def receive_update():
+    try:
+        update = telebot.types.Update.de_json(request.get_data(as_text=True))
+        bot.process_new_updates([update])
+    except Exception:
+        log.exception("Webhook update error.")
+    return "OK", 200
+
+@app.route("/")
+def index():
+    return "Cita Facil bot is running. Real slot checker is not configured.", 200
+
+@app.route("/setwebhook")
+def set_webhook_route():
+    return f"Webhook set: {configure_webhook()}", 200
+
+@app.route("/webhookinfo")
+def webhook_info_route():
+    try:
+        info = bot.get_webhook_info()
+        safe_url = (info.url or "").replace(TOKEN, "<TOKEN>")
+        return (
+            f"url: {safe_url}\n"
+            f"pending_update_count: {info.pending_update_count}\n"
+            f"last_error_date: {info.last_error_date}\n"
+            f"last_error_message: {info.last_error_message}\n"
+            f"storage: {'DATABASE' if USE_DB else 'MEMORY'}\n"
+            f"slot_checker: NOT CONFIGURED\n"
+        ), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        log.exception("Webhook info error.")
+        return f"Error: {exc}", 500
+
+# ---------------- COMMANDS ----------------
 @bot.message_handler(commands=["myid"])
-def myid(message):
-    bot.reply_to(message, f"آپ کی Telegram ID: {message.chat.id}")
+def my_id(message):
+    bot.reply_to(message, f"Your Telegram chat ID: {message.chat.id}")
 
-@bot.message_handler(commands=["help"])
-def help_command(message):
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+    if not allowed(message):
+        return
     bot.reply_to(
         message,
-        "استعمال کا طریقہ:\n"
-        "1) /addclient لکھیں۔\n"
-        "2) اگلے پیغام میں یہ فارمیٹ بھیجیں:\n"
-        "نام | سروس | شہر | فون (اختیاری)\n\n"
-        "مثال:\n"
-        "Ali | Huellas | Barcelona | 600123456\n\n"
-        "سروس: NIE، TIE، Huellas یا Padrón\n"
-        "کلائنٹس دیکھنے/حذف کرنے کے لیے ایڈمن اجازت ضروری ہے۔\n\n"
-        "نوٹ: یہ ورژن ابھی سرکاری پورٹل سے خودکار slot availability چیک نہیں کرتا۔"
-    )
-
-@bot.message_handler(commands=["addclient"])
-def addclient(message):
-    waiting_for_client.add(message.chat.id)
-    bot.reply_to(
-        message,
-        "کلائنٹ کی تفصیل ایک ہی پیغام میں بھیجیں:\n"
-        "نام | سروس | شہر | فون (اختیاری)\n\n"
-        "مثال: Ali | Huellas | Barcelona | 600123456\n"
-        "منسوخ کرنے کے لیے /cancel لکھیں۔"
+        "🇪🇸 Cita Facil España Bot is active.\n\n"
+        "/addclient - Add a client\n"
+        "/viewclients - View saved clients\n"
+        "/deleteclient ID - Delete a client\n"
+        "/checkslots - Official appointment links\n"
+        "/checknow - Show checker status\n"
+        "/testalert - Send a TEST alert (not a real slot)\n"
+        "/health - Bot health\n"
+        "/status - Storage status\n"
+        "/cancel - Cancel current entry"
     )
 
 @bot.message_handler(commands=["cancel"])
-def cancel(message):
-    waiting_for_client.discard(message.chat.id)
-    bot.reply_to(message, "عمل منسوخ کر دیا گیا۔")
+def cancel_action(message):
+    if not allowed(message):
+        return
+    STATE.pop(message.chat.id, None)
+    bot.reply_to(message, "Entry cancelled.")
 
-@bot.message_handler(commands=["viewclients"])
-def viewclients(message):
-    if not is_admin(message):
-        bot.reply_to(message, "یہ کمانڈ صرف ایڈمن کے لیے ہے۔")
+@bot.message_handler(commands=["status"])
+def status_info(message):
+    if not allowed(message):
         return
-    rows = db_list_clients()
-    if not rows:
-        bot.reply_to(message, "ابھی کوئی کلائنٹ محفوظ نہیں۔")
-        return
-    lines = ["محفوظ کلائنٹس (زیادہ سے زیادہ آخری 100):"]
-    for row in rows:
-        phone = row.get("phone") or "-"
-        lines.append(
-            f"ID {row['id']}: {row['client_name']} | "
-            f"{row['service']} | {row['city']} | {phone}"
-        )
-    # Telegram message limit safety
-    text = "\n".join(lines)
-    for start_index in range(0, len(text), 3500):
-        bot.send_message(message.chat.id, text[start_index:start_index + 3500])
+    mode = "PostgreSQL DATABASE" if USE_DB else "MEMORY (temporary)"
+    bot.reply_to(message, f"Storage mode: {mode}")
 
-@bot.message_handler(commands=["deleteclient"])
-def deleteclient(message):
-    if not is_admin(message):
-        bot.reply_to(message, "یہ کمانڈ صرف ایڈمن کے لیے ہے۔")
+@bot.message_handler(commands=["health"])
+def health_status(message):
+    if not allowed(message):
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].isdigit():
-        bot.reply_to(message, "استعمال: /deleteclient 12")
-        return
-    if db_delete_client(int(parts[1])):
-        bot.reply_to(message, "کلائنٹ حذف کر دیا گیا۔")
-    else:
-        bot.reply_to(message, "اس ID کا کلائنٹ نہیں ملا۔")
-
-@bot.message_handler(commands=["checkslots"])
-def checkslots(message):
     bot.reply_to(
         message,
-        "سرکاری اپائنٹمنٹ پورٹل:\n"
-        f"NIE / TIE / Huellas: {SERVICE_LINKS['NIE']}\n"
-        f"Padrón (Badalona): {SERVICE_LINKS['Padrón']}\n\n"
-        "ہر شہر کا Padrón الگ ہوتا ہے۔ یہ لنکس صرف سرکاری صفحات کھولتے ہیں؛ "
-        "اس ورژن میں خودکار slot detection فعال نہیں ہے۔"
+        "BOT HEALTH\n\n"
+        "Telegram bot: Running\n"
+        f"Storage: {'DATABASE' if USE_DB else 'MEMORY'}\n"
+        f"Last checker status: {LAST_CHECK_STATUS}\n"
+        "Real government slot checker: NOT CONFIGURED\n"
+        "No real slot counts are currently being checked."
+    )
+
+@bot.message_handler(commands=["checkslots"])
+def check_slots_links(message):
+    if not allowed(message):
+        return
+    bot.reply_to(
+        message,
+        "Official Cita Previa portal:\n"
+        "https://icp.administracionelectronica.gob.es/icpplus/index.html\n\n"
+        "Padrón is a separate local council process."
     )
 
 @bot.message_handler(commands=["checknow"])
-def checknow(message):
+def manual_check_now(message):
+    if not allowed(message):
+        return
     bot.reply_to(
         message,
-        "ابھی بوٹ نے کوئی حقیقی slot چیک نہیں کیا۔\n"
-        "خودکار چیکنگ شامل کرنے کے لیے متعلقہ سرکاری پورٹل کا جائز، "
-        "دستیاب طریقہ/API پہلے verify کرنا ہوگا۔ CAPTCHA یا حفاظتی رکاوٹ "
-        "کو bypass نہیں کیا جائے گا۔\n\n"
-        "فی الحال /checkslots سے سرکاری لنک کھولیں۔"
+        "⚠️ Real slot check is not connected yet.\n"
+        "The bot has NOT checked Barcelona or Madrid availability.\n"
+        "No slot count is available at this time."
     )
 
-@bot.message_handler(commands=["status", "health"])
-def status(message):
-    db_status = "PostgreSQL connected/configured" if DATABASE_URL else "Temporary memory only (DATABASE_URL missing)"
-    bot.reply_to(
-        message,
-        "بوٹ چل رہا ہے۔\n"
-        f"Database: {db_status}\n"
-        f"Saved clients: {clients_count()}\n"
-        "Automatic slot checker: ابھی فعال نہیں"
-    )
-
-@bot.message_handler(commands=["notify"])
-def notify(message):
-    if not is_admin(message):
-        bot.reply_to(message, "یہ کمانڈ صرف ایڈمن کے لیے ہے۔")
+@bot.message_handler(commands=["testalert"])
+def test_alert(message):
+    if not allowed(message):
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "استعمال: /notify آپ کا پیغام")
+    if not ADMIN_ID:
+        bot.reply_to(message, "ADMIN_ID is missing in Render environment variables.")
         return
-    bot.reply_to(message, "پیغام صرف آپ کے ایڈمن چیٹ میں موصول ہوا؛ براڈکاسٹ ابھی شامل نہیں۔")
-
-@bot.message_handler(func=lambda m: m.chat.id in waiting_for_client, content_types=["text"])
-def receive_client(message):
-    raw = message.text.strip()
-    if raw.startswith("/"):
-        return
-    parts = [p.strip() for p in raw.split("|")]
-    if len(parts) < 3 or not all(parts[:3]):
-        bot.reply_to(message, "فارمیٹ درست نہیں۔ مثال:\nAli | Huellas | Barcelona | 600123456")
-        return
-    name, service, city = parts[:3]
-    phone = parts[3] if len(parts) > 3 else ""
-    allowed_services = {"nie", "tie", "huellas", "padrón", "padron"}
-    if service.casefold() not in allowed_services:
-        bot.reply_to(message, "سروس NIE، TIE، Huellas یا Padrón میں سے لکھیں۔")
-        return
-    if service.casefold() == "padron":
-        service = "Padrón"
-    elif service.casefold() == "nie":
-        service = "NIE"
-    elif service.casefold() == "tie":
-        service = "TIE"
-    elif service.casefold() == "huellas":
-        service = "Huellas"
-    try:
-        new_id = db_add_client(message.chat.id, name, service, city, phone)
-        waiting_for_client.discard(message.chat.id)
-        storage = "PostgreSQL" if DATABASE_URL else "عارضی میموری"
+    sent = send_slot_alert("TEST ONLY", "Test office", 3)
+    if sent:
         bot.reply_to(
             message,
-            f"کلائنٹ محفوظ ہو گیا۔ ID: {new_id}\n"
-            f"نام: {name}\nسروس: {service}\nشہر: {city}\n"
-            f"محفوظ کرنے کی جگہ: {storage}"
+            "Test alert sent. The number 3 is only a test, NOT real availability."
         )
-    except Exception:
-        log.exception("Could not save client")
-        bot.reply_to(message, "ڈیٹا محفوظ نہیں ہو سکا۔ Render logs اور DATABASE_URL چیک کریں۔")
+    else:
+        bot.reply_to(message, "Test alert could not be sent. Check Render logs.")
 
-@app.get("/")
-def home():
-    return "Cita Bot is running. Automatic appointment slot checking is not enabled.", 200
+# ---------------- CLIENT ADD FLOW ----------------
+@bot.message_handler(commands=["addclient"])
+def add_client_start(message):
+    if not allowed(message):
+        return
+    STATE[message.chat.id] = {"step": "service"}
+    bot.send_message(
+        message.chat.id,
+        "Select client service:",
+        reply_markup=service_keyboard(),
+    )
 
-@app.get("/health")
-def web_health():
-    return {"status": "ok", "time_utc": datetime.now(timezone.utc).isoformat()}, 200
-
-@app.post("/" + TOKEN)
-def telegram_webhook():
-    if request.headers.get("content-type") != "application/json":
-        abort(403)
-    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
-
-def configure_webhook():
-    if not BOT_URL:
-        log.warning("BOT_URL missing; webhook was not configured.")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("svc:"))
+def add_client_service(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id):
+        bot.answer_callback_query(call.id)
+        return
+    if chat_id not in STATE or STATE[chat_id].get("step") != "service":
+        bot.answer_callback_query(call.id, "Start with /addclient")
         return
     try:
-        result = bot.set_webhook(url=f"{BOT_URL}/{TOKEN}")
-        log.info("Webhook configured: %s", result)
-    except Exception:
-        log.exception("Webhook configuration failed")
+        svc_idx = int(call.data.split(":")[1])
+        STATE[chat_id]["service"] = SERVICES[svc_idx]
+        STATE[chat_id]["step"] = "city"
+        bot.edit_message_text(
+            "Select city:",
+            chat_id,
+            call.message.message_id,
+            reply_markup=city_keyboard(),
+        )
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Invalid selection")
+    bot.answer_callback_query(call.id)
 
-try:
-    ensure_database()
-except Exception:
-    log.exception("Database initialization failed. Bot will still start, but database features may fail.")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("city:"))
+def add_client_city(call):
+    chat_id = call.message.chat.id
+    if not allowed_chat(chat_id):
+        bot.answer_callback_query(call.id)
+        return
+    if chat_id not in STATE or STATE[chat_id].get("step") != "city":
+        bot.answer_callback_query(call.id, "Start with /addclient")
+        return
 
-configure_webhook()
+    city_data = call.data.split(":", 1)[1]
+    if city_data == "other":
+        STATE[chat_id]["step"] = "custom_city"
+        bot.edit_message_text(
+            "Type the city name:",
+            chat_id,
+            call.message.message_id,
+        )
+    else:
+        try:
+            city_idx = int(city_data)
+            STATE[chat_id]["city"] = CITIES[city_idx]
+            STATE[chat_id]["step"] = "details"
+            bot.edit_message_text(
+                "Enter client details. Avoid sending passport numbers or other "
+                "sensitive identity data unless absolutely necessary and secure.",
+                chat_id,
+                call.message.message_id,
+            )
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Invalid city")
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(
+    func=lambda msg: msg.chat.id in STATE
+    and STATE[msg.chat.id].get("step") == "custom_city"
+)
+def add_client_custom_city(message):
+    if not allowed(message):
+        return
+    city = (message.text or "").strip()
+    if not city:
+        bot.reply_to(message, "Please type a city name.")
+        return
+    STATE[message.chat.id]["city"] = city[:100]
+    STATE[message.chat.id]["step"] = "details"
+    bot.reply_to(
+        message,
+        "Enter client details. Avoid sending passport numbers or other "
+        "sensitive identity data unless absolutely necessary and secure."
+    )
+
+@bot.message_handler(
+    func=lambda msg: msg.chat.id in STATE
+    and STATE[msg.chat.id].get("step") == "details"
+)
+def add_client_final(message):
+    if not allowed(message):
+        return
+    details = (message.text or "").strip()
+    if not details:
+        bot.reply_to(message, "Please enter the details or use /cancel.")
+        return
+    data = STATE[message.chat.id]
+    rec_id = save_record(data["service"], data["city"], details)
+    STATE.pop(message.chat.id, None)
+    bot.reply_to(
+        message,
+        f"Saved. Client ID: {rec_id}\n"
+        f"Service: {data['service']}\nCity: {data['city']}"
+    )
+
+@bot.message_handler(commands=["viewclients"])
+def view_clients(message):
+    if not allowed(message):
+        return
+    records = list_records()
+    if not records:
+        bot.reply_to(message, "No saved clients.")
+        return
+    lines = ["Saved clients:"]
+    for rec in records:
+        lines.append(
+            f"ID: {rec['id']} | {rec['city']} | {rec['service']}\n"
+            f"Details: {rec['details']}"
+        )
+    send_long(message.chat.id, "\n\n".join(lines))
+
+@bot.message_handler(commands=["deleteclient"])
+def delete_client_cmd(message):
+    if not allowed(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Use: /deleteclient ID")
+        return
+    try:
+        rec_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Please provide a numeric client ID.")
+        return
+    if delete_record(rec_id):
+        bot.reply_to(message, f"Client ID {rec_id} deleted.")
+    else:
+        bot.reply_to(message, f"Client ID {rec_id} was not found.")
+
+# ---------------- STARTUP ----------------
+init_storage()
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    configure_webhook()
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        )
     
