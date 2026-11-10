@@ -5,3 +5,4 @@ psycopg2-binary==2.9.10
 selenium>=4.25,<5
 backoff>=2.2,<3
 requests>=2.32,<3
+playwright>=1.50,<2
